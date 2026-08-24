@@ -35,15 +35,43 @@ plus `LICENSE`, which Apache-2.0 §4(a) requires travel with the source.
 
 ## Changes to the vendored slice
 
-**None at this commit.** Commit 1 is byte-identical to the source, deliberately: the
-`git diff` between it and the patch commit that follows is the permanent record of
-what we changed, with no `patches/` directory to maintain and no reference checkout
-needed to answer "what did we change".
+Four backports from upstream `anthropics/jacobian-lens` at `581d398`, applied on top of
+the byte-identical vendoring commit `4fc2167`. `git diff 4fc2167 -- harness/` is the
+permanent record of what we changed — no `patches/` directory to maintain, and no
+reference checkout needed to answer "what did we change".
 
-Four backports from upstream `anthropics/jacobian-lens` at `581d398` land in the next
-commit — `checkpoint_every`, resume validation of `target_layer`/`skip_first`, the
-`skip_first < 0` guard, and `save(dtype=)`. Every one is behaviour-preserving at its
-default or opt-in.
+| Item | File | What |
+|---|---|---|
+| `checkpoint_every` | `jlens/fitting.py` | Cadence control on `write_checkpoint()`'s two call sites |
+| Resume validation | `jlens/fitting.py` | Store `target_layer` / `skip_first` in the checkpoint **and** check them on resume |
+| `skip_first` guard | `jlens/fitting.py` | Reject negative `skip_first` in `valid_position_mask` |
+| `save(dtype=)` | `jlens/lens.py` | Parameterise save precision instead of hardcoding fp16 |
+
+**Every one is behaviour-preserving at its default or opt-in** — `checkpoint_every=1` is
+the vendored cadence, `dtype=torch.float16` is the vendored precision, and both
+validations fire only on input that is already wrong. The estimator is untouched, so an
+artifact-comparable fit cannot change. That is verified rather than asserted: a
+before/after smoke fit must produce an identical lens tensor (T7), and the resume path
+T7 cannot reach is covered by `tests/test_harness_backports.py`.
+
+Upstream's `if key in state` guard on the resume check **was** kept. It tolerates
+checkpoints written before those keys were stored — exactly the class of checkpoint our
+own pre-patch runs produce — so any such checkpoint stays unprotected forever, which is
+why landing this before long fits exist is worth strictly more than landing it after.
+
+**One deliberate deviation from upstream: `checkpoint_every=None`.** Upstream reads
+`None` as "skip per-iteration writes and save once at the end", which requires a third
+`write_checkpoint()` call after the loop. We did not port that call, so for us `None`
+disables checkpoint writes entirely. The reason is local: `fit_lens.py` deletes the
+checkpoint as soon as the lens is saved, so a trailing write would be written and
+immediately unlinked — negligible at 0.8B, ~6.7 GB at 27B, and pure waste at both. If a
+caller ever wants a durable end-of-fit checkpoint, add the trailing call rather than
+reaching for `None`.
+
+**Deferred, with triggers.** `_check_layer_indices()` lands with the first patch that
+passes `source_layers` explicitly — expected before the 27B fit — so the guard arrives
+alongside the argument it guards. `apply(positions=…)` lands at the first
+multi-position readout. Neither is in this commit.
 
 **What stays Neuronpedia's, and must not be "fixed" from upstream:**
 `metrics_callback` / `FitProgress`, `identity_distance`, and `mean_rel_change`. The

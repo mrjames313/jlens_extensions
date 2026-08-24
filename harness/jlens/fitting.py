@@ -100,8 +100,11 @@ def valid_position_mask(seq_len: int, *, skip_first: int = SKIP_FIRST_N_POSITION
         Boolean tensor of shape ``[seq_len]``.
 
     Raises:
-        ValueError: If the prompt is too short to leave any valid positions.
+        ValueError: If ``skip_first`` is negative or the prompt is too short to
+            leave any valid positions.
     """
+    if skip_first < 0:
+        raise ValueError(f"skip_first must be >= 0, got {skip_first}")
     mask = torch.zeros(seq_len, dtype=torch.bool)
     mask[skip_first : seq_len - 1] = True
     if mask.sum() == 0:
@@ -244,6 +247,7 @@ def fit(
     max_seq_len: int = 128,
     skip_first: int = SKIP_FIRST_N_POSITIONS,
     checkpoint_path: str | None = None,
+    checkpoint_every: int | None = 1,
     resume: bool = True,
     metrics_callback: Callable[[FitProgress], bool | None] | None = None,
 ) -> JacobianLens:
@@ -251,7 +255,8 @@ def fit(
 
     The per-prompt Jacobians from :func:`jacobian_for_prompt` are accumulated as
     a running mean. If ``checkpoint_path`` is set, the running sum is saved
-    after every prompt (atomic write) and resumed from on restart.
+    every ``checkpoint_every`` prompts (atomic write) and resumed from on
+    restart.
 
     Args:
         model: The model to fit on.
@@ -264,14 +269,20 @@ def fit(
         dim_batch: See :func:`jacobian_for_prompt`.
         max_seq_len: Truncate each prompt to this many tokens.
         skip_first: See :func:`jacobian_for_prompt`.
-        checkpoint_path: If set, write a resumable checkpoint here after every
-            prompt.
+        checkpoint_path: If set, write a resumable checkpoint here.
+        checkpoint_every: Write the checkpoint every N prompts (default 1, i.e.
+            after every prompt). The checkpoint is the whole running sum
+            (``len(source_layers) * d_model**2 * 4`` bytes), so raise this for
+            large models. ``None`` disables checkpoint writes entirely — note
+            this differs from upstream, whose ``None`` still saves once at the
+            end; see PROVENANCE.md.
         resume: If ``True`` and ``checkpoint_path`` exists, resume from it.
         metrics_callback: If set, called after every successfully processed
             prompt with a :class:`FitProgress`. Use it to log/plot the
             convergence metric and decide how many prompts are enough. If it
             returns a truthy value, fitting stops early (a checkpoint is still
-            written first) — e.g. to halt once the lens has converged.
+            written first, subject to ``checkpoint_every``) — e.g. to halt once
+            the lens has converged.
 
     Returns:
         The fitted :class:`JacobianLens`.
@@ -307,11 +318,18 @@ def fit(
     next_idx: int
     if resume and checkpoint_path is not None and os.path.exists(checkpoint_path):
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        if set(state["source_layers"]) != set(source_layers):
-            raise ValueError(
-                f"checkpoint at {checkpoint_path} was fitted with source_layers="
-                f"{state['source_layers']}, not {source_layers} — pass resume=False to discard it"
-            )
+        # ``if key in state`` tolerates checkpoints written before target_layer
+        # and skip_first were stored; those stay unvalidated on that key.
+        for key, expected in (
+            ("source_layers", source_layers),
+            ("target_layer", target_layer),
+            ("skip_first", skip_first),
+        ):
+            if key in state and state[key] != expected:
+                raise ValueError(
+                    f"checkpoint at {checkpoint_path} was fitted with {key}="
+                    f"{state[key]!r}, not {expected!r} — pass resume=False to discard it"
+                )
         jacobian_sum, n_done, next_idx = state["jacobian_sum"], state["n_done"], state["next_idx"]
         logger.info("  resuming from checkpoint: %d/%d prompts processed", next_idx, len(prompts))
     else:
@@ -329,9 +347,14 @@ def fit(
                     "n_done": n_done,
                     "next_idx": next_idx,
                     "source_layers": source_layers,
+                    "target_layer": target_layer,
+                    "skip_first": skip_first,
                 },
                 checkpoint_path,
             )
+
+    def checkpoint_due() -> bool:
+        return checkpoint_every is not None and next_idx % checkpoint_every == 0
 
     late_layer = max(source_layers)
     for prompt_idx, prompt in enumerate(prompts):
@@ -351,7 +374,8 @@ def fit(
         except ValueError as exc:
             logger.warning("  skipping prompt %d: %s", prompt_idx, exc)
             next_idx = prompt_idx + 1
-            write_checkpoint()
+            if checkpoint_due():
+                write_checkpoint()
             continue
         # Relative change of the running mean contributed by this prompt,
         # averaged over fitted layers — the "is it still moving?" signal.
@@ -405,7 +429,8 @@ def fit(
                     )
                 )
             )
-        write_checkpoint()
+        if checkpoint_due():
+            write_checkpoint()
         if stop_requested:
             logger.info("  metrics_callback requested early stop after %d prompts", n_done)
             break
