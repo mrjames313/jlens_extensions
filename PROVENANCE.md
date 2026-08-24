@@ -64,4 +64,41 @@ surrounding configuration:
   ARM64, not x86, so the wheel that index serves may not be the one we need. Resolving
   this is T3's job, and whatever it settles on gets recorded below.
 
-_(T3 appends the resolved environment's deviations here.)_
+### Resolved environment — T3, 2026-08-24, machine `gx10-ace5`
+
+Resolved with `uv sync --extra dev` against PyPI with **no index configuration at all**.
+PyPI served a CUDA-enabled `linux_aarch64` wheel directly, so the `pytorch-cu128`
+routing we declined to inherit turned out to be unnecessary rather than merely wrong
+for us. Python 3.12.3.
+
+Against Neuronpedia's `uv.lock`:
+
+| package | Neuronpedia | ours | |
+|---|---|---|---|
+| accelerate | 1.14.0 | 1.14.0 | identical |
+| tokenizers | 0.22.2 | 0.22.2 | identical |
+| sentencepiece | 0.2.1 | 0.2.2 | patch |
+| datasets | 5.0.0 | 5.0.1 | patch |
+| tqdm | 4.68.2 | 4.70.0 | minor |
+| transformers | 5.11.0 | 5.15.1 | minor |
+| numpy | 2.2.6 / 2.4.6 | 2.5.2 | minor |
+| **torch** | **2.11.0+cu128** | **2.13.0+cu130** | **two minors + a CUDA major** |
+
+`torch` is the only substantive difference, and it is **forced rather than chosen**:
+the GB10 is compute capability `sm_121` behind a CUDA 13.0 driver (580.173.02).
+Neuronpedia's doubled `numpy` and `torch` rows are uv locking per-platform
+resolutions; the `+cu128` branch is the one their `sys_platform` marker selects.
+(`importlib.metadata` reports our torch as `2.13.0` while `torch.__version__` carries
+the local segment `+cu130` — same wheel.)
+
+**What their lock does and does not establish.** It is a single commit dated
+2026-07-06 — **25 days after** the Qwen3.5-0.8B lens was fit on 2026-06-11 — and the
+published `config.yaml` records no library versions whatsoever. So the left column is
+the best available evidence of their environment, not a record of what produced the
+artifact; fit-time `transformers` was `<= 5.11.0` and could have been older. That
+asymmetry is precisely what our own provenance sidecar exists to avoid on this side.
+
+**If T16's comparison disagrees beyond the ~5e-4 fp16 floor, start here, and suspect
+`torch` first.** The estimator is our vendored copy and byte-identical to theirs, so a
+numerical difference cannot originate in the lens math — it has to enter through the
+libraries that load the weights, tokenize the corpus, or execute the kernels.
