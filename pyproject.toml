@@ -1,0 +1,43 @@
+[project]
+name = "jlens-extensions"
+version = "0.1.0"
+description = "Reproduction and extension work on the Jacobian lens, over local open-weight models."
+requires-python = ">=3.10"
+
+# Seeded verbatim from Neuronpedia's harness pyproject.toml at 93b8cae so this
+# list stays auditable against theirs. Any deviation goes in PROVENANCE.md --
+# an unrecorded one is what makes a later numerical disagreement undiagnosable.
+dependencies = [
+    "accelerate>=1.0.0",
+    "datasets>=3.0.0",
+    "numpy>=1.26.0",
+    "sentencepiece>=0.2.0",
+    "torch>=2.8.0",
+    "tqdm>=4.66.0",
+    "transformers>=4.50.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# --- Packaging -------------------------------------------------------------
+# Only `src/` is searched, so `harness/jlens/` is never discovered as a package.
+#
+# This is load-bearing, not tidiness. `fit_lens.py` does a bare `import jlens`,
+# resolved through `sys.path[0]` -- the script's own directory. If `harness/jlens/`
+# were ever installed, an installed `jlens` would compete with the script-resolved
+# one and which you got would depend on the working directory.
+#
+# `where = ["src"]` alone already makes `harness/` undiscoverable; the explicit
+# exclude below is belt-and-braces, stating the intent so a later edit widening
+# the search path doesn't quietly undo it.
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = ["harness*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

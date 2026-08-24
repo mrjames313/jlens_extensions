@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+
+# Fit outputs. Lenses, checkpoints and convergence traces belong under
+# $JLENS_ARTIFACT_ROOT / $JLENS_SCRATCH_ROOT, never in the repo. fit_lens.py's
+# --out_dir defaults to ./out, so this catches an accidental in-repo run.
+out/
+*.pt
+*_convergence.csv
+
+# NOT ignored: the resolved dependency lock. T3 commits it deliberately -- it is
+# what makes a fit re-derivable.
