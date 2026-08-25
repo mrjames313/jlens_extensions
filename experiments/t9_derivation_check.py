@@ -1,28 +1,34 @@
-"""T9 follow-up -- why does the corrected ranking disagree with unembed() 7% of the time?
+"""Validate the dictionary construction against a model's actual readout.
 
-The main driver's end-to-end check came back at 0.93 rather than ~1.0. Two
-candidate causes, with very different consequences:
+Run this for **every new model** before trusting any dictionary-derived number
+from it. It is cheap, and it is what caught the bug that voided T9's first run:
+``Qwen3_5RMSNorm`` applies ``x/rms(x) * (1 + w)`` rather than ``* w``, so reading
+``.weight`` as the gain produced a dictionary wrong by a constant offset -- with
+plausible output and no error, which is the failure mode the whole module exists
+to prevent.
+
+Two things can make our ranking disagree with the model's, and they have very
+different consequences:
 
 1. **Precision.** ``HFLensModel.unembed`` casts to the lm_head's dtype (bf16 here)
    and runs the norm and the unembedding matmul there, while ``lens_logits`` runs
    fp32 throughout. bf16 carries 8 mantissa bits (~0.4% relative), and across a
-   248k vocabulary the top-1/top-2 gap is often smaller than that. Harmless: it
-   says the instrument is blunt, not that the algebra is wrong.
+   248k vocabulary the top-1/top-2 gap is often smaller than that. Harmless: the
+   instrument is blunt, the algebra is fine.
 
-2. **Norm convention.** Some families implement RMSNorm as ``x/rms(x) * (1 + w)``
-   rather than ``* w`` (Gemma does). Under that convention our gamma is off by a
-   constant offset and every corrected vector is wrong. Not harmless.
+2. **Construction.** A convention mismatch, a transpose, a layer off-by-one. Every
+   dictionary vector is then wrong and nothing raises.
 
-The separation has to be non-circular: comparing our formula against our formula
-proves nothing. So the reference here is the model's **own** norm module,
-deep-copied and cast to fp32 -- the module's math, at our precision.
+Separating them has to be non-circular -- comparing our formula against our
+formula proves nothing -- so the reference is the model's **own** norm module,
+deep-copied to fp32: its math, at our precision.
 
-    ours  vs  module-in-fp32   -> isolates ALGEBRA (expect ~1.0)
-    ours  vs  module-in-bf16   -> isolates PRECISION (expect the ~0.93 we saw)
+    ours  vs  module-in-fp32   -> isolates CONSTRUCTION (expect ~1.0)
+    ours  vs  module-in-bf16   -> isolates PRECISION (expect slightly below)
 
-Then, for the positions that still disagree, we ask whether they are near-ties:
-where our top-1 ranks under the reference, and the relative logit gap. Near-ties
-mean precision; wild rank displacements mean something structural.
+Then, for positions that still disagree, we ask whether they are near-ties: where
+our top-1 ranks under the reference, and the relative logit gap. Near-ties mean
+precision; rank displacement means something structural.
 
 Run::
 
@@ -41,7 +47,7 @@ sys.path.insert(0, str(REPO / "harness"))
 sys.path.insert(0, str(REPO / "src"))
 
 from jlens_extensions import config as jx_config  # noqa: E402
-from jlens_extensions.dictionary import lens_logits  # noqa: E402
+from jlens_extensions.dictionary import effective_gain, lens_logits  # noqa: E402
 
 cfg = jx_config.load()
 os.environ.update(cfg.hf_env())
@@ -70,31 +76,40 @@ def main() -> None:
     lm = jlens.from_hf(hf_model, tokenizer)
 
     norm = lm._final_norm
-    gamma = norm.weight.detach().to(torch.float32)
+    raw = norm.weight.detach().to(torch.float32)
+    # Probed, never read off .weight -- that is the whole point of this script.
+    gamma = effective_gain(norm)
 
-    # --- Q1. what IS this module? ------------------------------------------
-    print("--- Q1. the norm module ---")
+    # --- Q1. what IS this module, and did we recover its gain? --------------
+    print("--- Q1. the norm module and its effective gain ---")
     print(f"  type            {type(norm).__module__}.{type(norm).__name__}")
     print(f"  weight          shape={tuple(norm.weight.shape)} dtype={norm.weight.dtype}")
-    print(f"  extra attrs     {[a for a in vars(norm) if not a.startswith('_')]}")
     for attr in ("eps", "variance_epsilon", "epsilon"):
         if hasattr(norm, attr):
             print(f"  {attr:<15} {getattr(norm, attr)}")
-    print(f"  gamma mean      {gamma.mean().item():.4f}   (a '1 + w' convention would centre near 0)")
+    print(f"  raw .weight     mean {raw.mean().item():.4f}")
+    print(f"  effective gain  mean {gamma.mean().item():.4f}")
+
+    matches_plain = torch.allclose(gamma, raw, atol=1e-3)
+    matches_offset = torch.allclose(gamma, raw + 1.0, atol=1e-3)
+    convention = (
+        "PLAIN  x/rms(x) * w" if matches_plain
+        else "OFFSET x/rms(x) * (1 + w)" if matches_offset
+        else "NEITHER -- some other diagonal convention"
+    )
+    print(f"  convention      {convention}")
+    if not matches_plain:
+        print("                  reading .weight as the gain here would be WRONG;")
+        print("                  effective_gain() recovered it by probing instead.")
 
     # A deep copy at fp32: the module's own arithmetic, at our precision.
     norm32 = copy.deepcopy(norm).float()
-
+    eps = float(getattr(norm, "eps", None) or torch.finfo(torch.float32).eps)
     probe = torch.randn(64, gamma.numel(), device=gamma.device, dtype=torch.float32) * 3.0
     module_out = norm32(probe)
-    plain_formula = gamma * probe * torch.rsqrt(probe.pow(2).mean(-1, keepdim=True) + 1e-6)
-    offset_formula = (1.0 + gamma) * probe * torch.rsqrt(probe.pow(2).mean(-1, keepdim=True) + 1e-6)
-    err_plain = ((module_out - plain_formula).norm() / module_out.norm()).item()
-    err_offset = ((module_out - offset_formula).norm() / module_out.norm()).item()
-    print(f"\n  rel. error vs  gamma * x/rms(x)        {err_plain:.3e}   <-- what we assume")
-    print(f"  rel. error vs (1+gamma) * x/rms(x)     {err_offset:.3e}")
-    verdict = "PLAIN (our assumption holds)" if err_plain < err_offset else "OFFSET -- our gamma is WRONG"
-    print(f"  convention: {verdict}")
+    recovered = gamma * probe * torch.rsqrt(probe.pow(2).mean(-1, keepdim=True) + eps)
+    err = ((module_out - recovered).norm() / module_out.norm()).item()
+    print(f"\n  recovered gain reproduces the module to {err:.3e}  (expect ~1e-7)")
 
     # --- Q2/Q3. algebra vs precision ---------------------------------------
     W_U32 = lm._lm_head.weight.detach().to(torch.float32)
@@ -104,7 +119,7 @@ def main() -> None:
         text_field="text", n_prompts=N_PROMPTS, max_chars=2000,
     )
 
-    print("\n--- Q2. algebra (fp32 reference) vs precision (bf16 reference) ---")
+    print("\n--- Q2. construction (fp32 reference) vs precision (bf16 reference) ---")
     header = f"{'L':>3}  {'vs fp32':>9}  {'vs bf16':>9}  {'median rank':>11}  {'p90 rank':>8}  {'median gap':>10}"
     print(header)
     print("-" * len(header))
@@ -155,9 +170,9 @@ def main() -> None:
         )
 
     print("\nreading:")
-    print("  'vs fp32' ~1.0        -> the algebra is right; the 0.93 is bf16 and nothing more.")
-    print("  'vs fp32' ~0.93 too   -> the disagreement is structural, not precision. Stop and debug.")
-    print("  median rank 1 (i.e. our top-1 is the reference's 2nd) with a tiny gap -> near-ties.")
+    print("  'vs fp32' ~1.0          -> construction is right; any shortfall vs bf16 is precision.")
+    print("  'vs fp32' well below 1  -> structural, not precision. Stop and debug.")
+    print("  median rank 1 (our top-1 is the reference's 2nd) with a tiny gap -> near-ties.")
 
 
 if __name__ == "__main__":
