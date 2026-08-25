@@ -106,12 +106,18 @@ def effective_gain(norm: torch.nn.Module, *, rtol: float = 1e-4) -> torch.Tensor
     # so probing does not silently downcast a high-precision one.
     dtype = weight.dtype if weight.dtype in (torch.float32, torch.float64) else torch.float32
     probe_norm = copy.deepcopy(norm).to(dtype).eval()
-    eps = float(
-        next(
-            (getattr(norm, a) for a in ("eps", "variance_epsilon", "epsilon") if hasattr(norm, a)),
-            0.0,
-        )
+    # Scan for a usable value, not merely a present attribute: `torch.nn.RMSNorm`
+    # ships `eps=None`, documented as "use torch.finfo(x.dtype).eps", so a hasattr
+    # check finds the attribute and then hands back None.
+    eps = next(
+        (
+            value
+            for value in (getattr(norm, a, None) for a in ("eps", "variance_epsilon", "epsilon"))
+            if value is not None
+        ),
+        None,
     )
+    eps = float(torch.finfo(dtype).eps if eps is None else eps)
 
     with torch.no_grad():
         probe = torch.eye(d_model, device=device, dtype=dtype) * math.sqrt(d_model)

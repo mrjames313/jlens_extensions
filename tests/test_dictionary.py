@@ -197,9 +197,15 @@ def test_wrong_jacobian_shape_is_rejected():
 # read `Qwen3_5RMSNorm.weight` on a `1 + w` module and every number was wrong.
 
 
-def test_effective_gain_of_a_plain_rmsnorm_is_its_weight():
+@pytest.mark.parametrize("eps", [None, 1e-6, 1e-5])
+def test_effective_gain_of_a_plain_rmsnorm_is_its_weight(eps):
+    """``eps=None`` is ``torch.nn.RMSNorm``'s default and means "use finfo eps".
+
+    It is parametrised because scanning for the attribute rather than for a usable
+    value found it present and ``None``, which is how this first failed.
+    """
     torch.manual_seed(0)
-    norm = torch.nn.RMSNorm(D_MODEL, dtype=torch.float64)
+    norm = torch.nn.RMSNorm(D_MODEL, eps=eps, dtype=torch.float64)
     with torch.no_grad():
         norm.weight.copy_(torch.rand(D_MODEL, dtype=torch.float64) * 3.0 + 0.2)
     assert torch.allclose(effective_gain(norm), norm.weight.detach(), atol=1e-9)
