@@ -146,10 +146,12 @@ def main() -> None:
     overlap = {layer: {k: 0 for k in K_VALUES} for layer in layers}
     top1_agree = {layer: 0 for layer in layers}
     readout_agree = {layer: 0 for layer in layers}
-    cosine_sum = {layer: 0.0 for layer in layers}
-    cosine_min = {layer: 1.0 for layer in layers}
-    cosine_n = {layer: 0 for layer in layers}
-    angle_max = {layer: 0.0 for layer in layers}
+    # Kept as samples rather than running extrema: the principal angle is the
+    # apparatus-relevant statistic, and a max over sampled positions does not
+    # converge -- it wanders by several degrees between adjacent layers for
+    # sampling reasons alone. Median and p90 are what the write-up should quote.
+    cosines: dict[int, list[float]] = {layer: [] for layer in layers}
+    angles: dict[int, list[float]] = {layer: [] for layer in layers}
 
     print("\nreading out ...", flush=True)
     for index, text in enumerate(prompts):
@@ -199,39 +201,42 @@ def main() -> None:
                     v_corrected = dictionary_vectors(W_U, gamma, J_bar, token_ids, correct=True)
                     v_plain = dictionary_vectors(W_U, gamma, J_bar, token_ids, correct=False)
                     cosine = torch.nn.functional.cosine_similarity(v_corrected, v_plain, dim=-1)
-                    cosine_sum[layer] += float(cosine.sum())
-                    cosine_min[layer] = min(cosine_min[layer], float(cosine.min()))
-                    cosine_n[layer] += int(cosine.numel())
+                    cosines[layer].extend(cosine.tolist())
                     # Largest principal angle between the two k-dim spans: the
                     # subspace a projection-out ablation would actually remove.
                     q_corrected, _ = torch.linalg.qr(v_corrected.T)
                     q_plain, _ = torch.linalg.qr(v_plain.T)
                     singular = torch.linalg.svdvals(q_corrected.T @ q_plain).clamp(-1.0, 1.0)
-                    angle = float(torch.rad2deg(torch.arccos(singular.min())))
-                    angle_max[layer] = max(angle_max[layer], angle)
+                    angles[layer].append(float(torch.rad2deg(torch.arccos(singular.min()))))
 
         print(f"  prompt {index}: {seq_len} tokens, {int(mask.sum())} valid positions", flush=True)
 
     per_layer = []
     for layer in layers:
         total = n_positions[layer]
+        cosine = torch.tensor(cosines[layer])
+        angle = torch.tensor(angles[layer])
         per_layer.append(
             {
                 "layer": layer,
                 "n_positions": total,
+                "n_vector_samples": int(angle.numel()),
                 **{f"overlap@{k}": overlap[layer][k] / total / k for k in K_VALUES},
                 "top1_agreement": top1_agree[layer] / total,
                 "real_readout_top1_agreement": readout_agree[layer] / total,
-                "mean_cosine_top10": cosine_sum[layer] / cosine_n[layer],
-                "min_cosine_top10": cosine_min[layer],
-                "max_principal_angle_deg": angle_max[layer],
+                "median_cosine_top10": cosine.median().item(),
+                "p10_cosine_top10": cosine.quantile(0.10).item(),
+                "min_cosine_top10": cosine.min().item(),
+                "median_principal_angle_deg": angle.median().item(),
+                "p90_principal_angle_deg": angle.quantile(0.90).item(),
+                "max_principal_angle_deg": angle.max().item(),
             }
         )
 
     print("\n--- B/C. per layer (overlap@k = mean |intersection| / k) ---")
     header = (
         f"{'L':>3}  {'ovl@10':>7} {'ovl@16':>7} {'ovl@25':>7}  {'top1':>6}  "
-        f"{'cos':>7} {'cosmin':>7}  {'angle':>6}"
+        f"{'cos~':>7} {'cos p10':>7}  {'ang~':>6} {'ang p90':>7} {'ang max':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -239,9 +244,12 @@ def main() -> None:
         print(
             f"{row['layer']:>3}  {row['overlap@10']:>7.3f} {row['overlap@16']:>7.3f} "
             f"{row['overlap@25']:>7.3f}  {row['top1_agreement']:>6.3f}  "
-            f"{row['mean_cosine_top10']:>7.4f} {row['min_cosine_top10']:>7.4f}  "
-            f"{row['max_principal_angle_deg']:>6.1f}"
+            f"{row['median_cosine_top10']:>7.4f} {row['p10_cosine_top10']:>7.4f}  "
+            f"{row['median_principal_angle_deg']:>6.1f} "
+            f"{row['p90_principal_angle_deg']:>7.1f} {row['max_principal_angle_deg']:>7.1f}"
         )
+    print(f"\n(~ = median. {per_layer[0]['n_vector_samples']} vector samples per layer;")
+    print(" quote the median and p90 -- the max is an extreme-value statistic and wanders.)")
 
     agreement = [row["real_readout_top1_agreement"] for row in per_layer]
     print("\nderivation check -- corrected ranking vs real unembed() top-1:")
