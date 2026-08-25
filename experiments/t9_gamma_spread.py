@@ -50,7 +50,12 @@ sys.path.insert(0, str(REPO / "harness"))
 sys.path.insert(0, str(REPO / "src"))  # no-op when the package is installed
 
 from jlens_extensions import config as jx_config  # noqa: E402
-from jlens_extensions.dictionary import dictionary_vectors, gain_spread, lens_logits  # noqa: E402
+from jlens_extensions.dictionary import (  # noqa: E402
+    dictionary_vectors,
+    effective_gain,
+    gain_spread,
+    lens_logits,
+)
 
 cfg = jx_config.load()
 # Confine HuggingFace downloads to our scratch root. Must precede the transformers
@@ -107,10 +112,16 @@ def main() -> None:
         raise SystemExit(f"final norm {type(lm._final_norm).__name__} has no .weight")
 
     # ------------------------------------------------------------------ part A
-    gamma = lm._final_norm.weight.detach().to(torch.float32)
+    # Probed, not read off .weight: Qwen3.5 applies `x/rms(x) * (1 + w)`, so the
+    # raw weight is not the gain. The first run of this driver read .weight and
+    # every number it produced was wrong by that offset.
+    gamma = effective_gain(lm._final_norm)
     gamma_stats = gain_spread(gamma)
-    gamma_stats["dtype"] = str(lm._final_norm.weight.dtype)
-    print("\n--- A. gamma (final_norm.weight) ---")
+    gamma_stats["norm_module"] = type(lm._final_norm).__name__
+    gamma_stats["weight_dtype"] = str(lm._final_norm.weight.dtype)
+    raw = lm._final_norm.weight.detach().to(torch.float32)
+    gamma_stats["offset_convention"] = bool(torch.allclose(gamma, raw + 1.0, atol=1e-3))
+    print("\n--- A. effective final-norm gain ---")
     print(json.dumps(gamma_stats, indent=2))
 
     W_U = lm._lm_head.weight.detach().to(torch.float32)

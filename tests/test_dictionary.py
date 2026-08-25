@@ -21,11 +21,29 @@ import torch
 from jlens_extensions.dictionary import (
     corrected_unembedding,
     dictionary_vectors,
+    effective_gain,
     gain_spread,
     lens_logits,
 )
 
 D_MODEL, VOCAB, N_POS = 16, 64, 5
+
+
+class OffsetRMSNorm(torch.nn.Module):
+    """RMSNorm under the ``x/rms(x) * (1 + w)`` convention.
+
+    Qwen3.5 and Gemma do this. Reading ``.weight`` off such a module and treating
+    it as the gain is the bug that invalidated T9's first run, so it gets a
+    stand-in here rather than being trusted to a comment.
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(d_model, dtype=torch.float64) * 0.5 + 3.0)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (1.0 + self.weight) * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
 
 def fixture(gain: torch.Tensor | None = None, seed: int = 0):
@@ -170,3 +188,62 @@ def test_wrong_jacobian_shape_is_rejected():
     W_U, _, h, _, gamma = fixture()
     with pytest.raises(ValueError, match="J_bar must be"):
         lens_logits(h, torch.eye(D_MODEL + 1, dtype=torch.float64), W_U, gamma)
+
+
+# --- recovering the gain from a module, without assuming its convention -------
+#
+# These exist because the tests above all pass while the *binding* to a real model
+# is wrong: they validate the formula, not which tensor is the gain. T9's first run
+# read `Qwen3_5RMSNorm.weight` on a `1 + w` module and every number was wrong.
+
+
+def test_effective_gain_of_a_plain_rmsnorm_is_its_weight():
+    torch.manual_seed(0)
+    norm = torch.nn.RMSNorm(D_MODEL, dtype=torch.float64)
+    with torch.no_grad():
+        norm.weight.copy_(torch.rand(D_MODEL, dtype=torch.float64) * 3.0 + 0.2)
+    assert torch.allclose(effective_gain(norm), norm.weight.detach(), atol=1e-9)
+
+
+def test_effective_gain_of_an_offset_rmsnorm_is_one_plus_its_weight():
+    """The regression test for the bug: the gain is NOT the raw weight here."""
+    torch.manual_seed(0)
+    norm = OffsetRMSNorm(D_MODEL)
+    gain = effective_gain(norm)
+    assert torch.allclose(gain, 1.0 + norm.weight.detach(), atol=1e-9)
+    assert not torch.allclose(gain, norm.weight.detach(), atol=1e-3)
+
+
+def test_effective_gain_rejects_a_module_that_is_not_a_diagonal_rescaling():
+    """LayerNorm subtracts a mean, so no per-dimension gain reproduces it."""
+    norm = torch.nn.LayerNorm(D_MODEL, dtype=torch.float64)
+    with torch.no_grad():
+        norm.weight.copy_(torch.rand(D_MODEL, dtype=torch.float64) + 0.5)
+    with pytest.raises(ValueError, match="not a diagonal rescaling"):
+        effective_gain(norm)
+
+
+def test_effective_gain_rejects_a_module_with_no_weight():
+    with pytest.raises(ValueError, match="no .weight"):
+        effective_gain(torch.nn.ReLU())
+
+
+def test_recovered_gain_ranks_correctly_where_the_raw_weight_does_not():
+    """End-to-end, through a module whose convention we deliberately do not assume.
+
+    This is the test that would have caught T9's first run. It asserts both halves:
+    the recovered gain reproduces the module's ranking, *and* the raw weight does
+    not -- so the test cannot pass by the two being interchangeable.
+    """
+    torch.manual_seed(0)
+    W_U = torch.randn(VOCAB, D_MODEL, dtype=torch.float64)
+    J_bar = torch.randn(D_MODEL, D_MODEL, dtype=torch.float64)
+    h = torch.randn(N_POS, D_MODEL, dtype=torch.float64)
+    norm = OffsetRMSNorm(D_MODEL)
+
+    reference = norm(h @ J_bar.T) @ W_U.T
+    with_recovered = lens_logits(h, J_bar, W_U, effective_gain(norm), correct=True)
+    with_raw_weight = lens_logits(h, J_bar, W_U, norm.weight.detach(), correct=True)
+
+    assert torch.equal(ranks(reference), ranks(with_recovered))
+    assert not torch.equal(ranks(reference), ranks(with_raw_weight))

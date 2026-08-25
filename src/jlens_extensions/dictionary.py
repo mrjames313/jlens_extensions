@@ -39,13 +39,31 @@ published artifacts for a reason unrelated to fit fidelity.
 
 See ``f-2026-08-18-jspace-construction-and-norm-gain`` for the full argument and
 ``ex-2026-08-18-jspace-dictionary-definition`` for research's reading of the paper.
+
+Obtaining the gain
+------------------
+
+**Do not read ``norm.weight`` and pass it here.** Model families disagree on the
+convention: ``torch.nn.RMSNorm`` and Llama apply ``x/rms(x) * w``, while Qwen3.5
+and Gemma apply ``x/rms(x) * (1 + w)``. Under the offset convention the raw weight
+is not the gain, and using it produces a dictionary that is wrong by a constant
+offset -- with no error, which is this module's whole subject. Use
+:func:`effective_gain`, which recovers the gain by probing the module rather than
+by assuming a convention.
+
+This was not hypothetical: T9's first run used ``Qwen3_5RMSNorm.weight`` directly
+and every number it produced had to be thrown away.
 """
 
 from __future__ import annotations
 
+import copy
+import math
+
 import torch
 
 __all__ = [
+    "effective_gain",
     "corrected_unembedding",
     "dictionary_vectors",
     "lens_logits",
@@ -53,12 +71,76 @@ __all__ = [
 ]
 
 
+def effective_gain(norm: torch.nn.Module, *, rtol: float = 1e-4) -> torch.Tensor:
+    """Recover a norm module's effective per-dimension gain, by probing it.
+
+    RMSNorm is ``g * x / rms(x)`` for some per-dimension ``g``. Rows of
+    ``sqrt(d) * I`` have ``rms`` exactly 1, so the module's output on that probe is
+    ``g * sqrt(d)`` down the diagonal -- which recovers ``g`` regardless of whether
+    the implementation spells it ``w``, ``1 + w``, or anything else diagonal.
+
+    The recovered gain is then checked against the module on random input, so a
+    module that is *not* a diagonal rescaling (LayerNorm, which subtracts a mean,
+    or anything with a bias) raises instead of silently returning nonsense.
+
+    Args:
+        norm: The final-norm module, e.g. ``HFLensModel._final_norm``.
+        rtol: Relative tolerance for the validation pass.
+
+    Returns:
+        ``[d_model]`` gain on the module's device, at float32 or the module's own
+        dtype if that is already float32 or float64.
+
+    Raises:
+        ValueError: If ``norm`` has no ``weight``, or if the recovered gain does
+            not reproduce the module's behaviour to within ``rtol``.
+    """
+    weight = getattr(norm, "weight", None)
+    if weight is None:
+        raise ValueError(f"{type(norm).__name__} has no .weight; cannot recover a gain")
+    d_model = int(weight.shape[-1])
+    device = weight.device
+
+    # Probe in at least float32: `1 + w` evaluated in bf16 would lose bits the
+    # model itself may keep. A module already at float32 or float64 is left alone,
+    # so probing does not silently downcast a high-precision one.
+    dtype = weight.dtype if weight.dtype in (torch.float32, torch.float64) else torch.float32
+    probe_norm = copy.deepcopy(norm).to(dtype).eval()
+    eps = float(
+        next(
+            (getattr(norm, a) for a in ("eps", "variance_epsilon", "epsilon") if hasattr(norm, a)),
+            0.0,
+        )
+    )
+
+    with torch.no_grad():
+        probe = torch.eye(d_model, device=device, dtype=dtype) * math.sqrt(d_model)
+        # rms(probe row) = sqrt(1 + eps), so undo that factor exactly.
+        gain = probe_norm(probe).diagonal().clone() * math.sqrt(1.0 + eps) / math.sqrt(d_model)
+
+        check = torch.randn(8, d_model, device=device, dtype=dtype) * 3.0
+        expected = gain * check * torch.rsqrt(check.pow(2).mean(-1, keepdim=True) + eps)
+        actual = probe_norm(check)
+        error = ((actual - expected).norm() / actual.norm().clamp(min=1e-12)).item()
+
+    if error > rtol:
+        raise ValueError(
+            f"{type(norm).__name__} is not a diagonal rescaling: the recovered gain "
+            f"reproduces it only to {error:.2e} (> rtol={rtol:g}). A LayerNorm-style "
+            f"module (mean subtraction, or a bias) needs handling this does not provide -- "
+            f"a bias contributes a per-token constant W_U.beta that shifts ranks and "
+            f"cannot be folded into a direction at all."
+        )
+    return gain
+
+
 def corrected_unembedding(W_U: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
     """``W~_U = W_U * gamma`` -- the gain folded into the unembedding.
 
     Args:
         W_U: Unembedding matrix, ``[vocab, d_model]``.
-        gamma: Final-norm gain, ``[d_model]`` (an RMSNorm module's ``.weight``).
+        gamma: Effective final-norm gain, ``[d_model]``, from :func:`effective_gain`.
+            **Not** a norm module's raw ``.weight`` -- see this module's docstring.
 
     Returns:
         ``[vocab, d_model]``. One row-wise scaling, computed once.
@@ -84,7 +166,7 @@ def dictionary_vectors(
 
     Args:
         W_U: Unembedding, ``[vocab, d_model]``.
-        gamma: Final-norm gain, ``[d_model]``.
+        gamma: Effective gain from :func:`effective_gain`, ``[d_model]``.
         J_bar: The fitted Jacobian for one layer, ``[d_model, d_model]``, in the
             harness's convention (``z = J_bar @ h``, i.e. ``h @ J_bar.T``).
         token_ids: Which vocabulary rows to form, ``[k]``.
@@ -124,7 +206,7 @@ def lens_logits(
         residual: ``[..., d_model]`` at layer ``l``.
         J_bar: ``[d_model, d_model]`` for that layer.
         W_U: ``[vocab, d_model]``.
-        gamma: ``[d_model]``.
+        gamma: Effective gain from :func:`effective_gain`, ``[d_model]``.
         correct: Fold ``gamma`` in; ``False`` gives the paper's construction.
 
     Returns:
