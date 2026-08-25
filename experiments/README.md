@@ -34,3 +34,4 @@ because those are large and machine-specific.
 | `t9_gamma_spread.py` | T9 | The γ spread for a model, the top-k dictionary overlap between the corrected and the paper's construction, and the vector/subspace divergence at a fixed token set. |
 | `t9_derivation_check.py` | T9 / any new model | Per-model validation: the norm's gain convention, and whether our dictionary construction reproduces the model's readout at equal precision. |
 | `t10_force_bos.py` | T10 | Whether `from_hf(force_bos=True)` changes the encoded ids on this tokenizer, or silently no-ops. |
+| `t11_dim_batch_sweep.py` | T11 | The `dim_batch` ceiling, per-prompt wall-clock and peak allocator memory, swept in fresh subprocesses. Projects the 233-prompt fit against T14's gate. |
