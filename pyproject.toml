@@ -35,9 +35,13 @@ build-backend = "setuptools.build_meta"
 # `where = ["src"]` alone already makes `harness/` undiscoverable; the explicit
 # exclude below is belt-and-braces, stating the intent so a later edit widening
 # the search path doesn't quietly undo it.
+#
+# `experiments/` is excluded for a milder reason: the drivers there are scripts,
+# run by path and never imported, so installing them would only create a second
+# way to reach code that has no stable API. See `experiments/README.md`.
 [tool.setuptools.packages.find]
 where = ["src"]
-exclude = ["harness*"]
+exclude = ["harness*", "experiments*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
