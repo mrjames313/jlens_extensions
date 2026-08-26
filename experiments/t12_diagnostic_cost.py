@@ -114,8 +114,13 @@ def patched_fit(variant: str):
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"t12-{variant}-"))
     tmp_file = tmp_dir / "fitting_patched.py"
     tmp_file.write_text(source)
-    spec = importlib.util.spec_from_file_location(f"jlens_fitting_{variant}", tmp_file)
+    name = f"jlens_fitting_{variant}"
+    spec = importlib.util.spec_from_file_location(name, tmp_file)
     module = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: @dataclass on FitProgress resolves its annotations via
+    # sys.modules[cls.__module__].__dict__, which is None for an unregistered module
+    # and fails as "'NoneType' object has no attribute '__dict__'".
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module.fit
 
@@ -219,7 +224,14 @@ def child(args: argparse.Namespace) -> None:
     try:
         result = run_one(args.single)
     except Exception as exc:  # noqa: BLE001
-        result = {"variant": args.single, "error": f"{type(exc).__name__}: {exc}"[:400]}
+        # Carry the traceback tail, not just the message: a bare exception string
+        # costs a whole round-trip to localise when the run is on another machine.
+        import traceback
+        result = {
+            "variant": args.single,
+            "error": f"{type(exc).__name__}: {exc}"[:400],
+            "traceback": traceback.format_exc()[-1200:],
+        }
     print(RESULT_PREFIX + json.dumps(result), flush=True)
 
 
@@ -247,6 +259,8 @@ def parent(args: argparse.Namespace) -> None:
             payload = {"variant": variant, "error": "no result; stderr: " + " | ".join(tail)}
         if "error" in payload:
             print(f"   FAILED: {payload['error'][:300]}", flush=True)
+            for line in payload.get("traceback", "").strip().splitlines()[-6:]:
+                print(f"     | {line}", flush=True)
         results.append(payload)
 
     after_hash = hashlib.sha256(FITTING_PY.read_bytes()).hexdigest()
@@ -285,10 +299,12 @@ def parent(args: argparse.Namespace) -> None:
     print("\n--- CPU micro-benchmark: the arithmetic alone ---")
     micro = micro_benchmark()
     summary["micro_benchmark"] = micro
-    print(f"  as shipped (4 temporaries/layer)  {micro['as_shipped_s']*1000:7.1f} ms")
-    print(f"  2-temporary rewrite, identical    {micro['two_temporaries_s']*1000:7.1f} ms")
-    print(f"  ratio                             {micro['ratio']:7.2f}x")
-    print(f"  allocated per prompt as shipped   {micro['bytes_per_prompt_shipped_gb']:7.2f} GB")
+    print(f"  as shipped                        {micro['as_shipped_s']*1000:7.1f} ms/prompt")
+    print(f"  2-temporary rewrite, identical    {micro['two_temporaries_s']*1000:7.1f} ms/prompt")
+    print(f"  saving from halving temporaries   {micro['ratio']:7.2f}x")
+    print(f"  allocated per prompt (4/layer)    {micro['bytes_per_prompt_shipped_gb']:7.2f} GB")
+    print("  (the temporary count is settled by reading the ops, not by this ratio --")
+    print("   a small ratio means the cost is not proportional to the count.)")
 
     out_dir = cfg.artifact_root / "measurements" / "t12"
     out_dir.mkdir(parents=True, exist_ok=True)
