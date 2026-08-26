@@ -2,7 +2,11 @@
 name = "jlens-extensions"
 version = "0.1.0"
 description = "Reproduction and extension work on the Jacobian lens, over local open-weight models."
-requires-python = ">=3.10"
+# >=3.11 rather than Neuronpedia's >=3.10: the machine profile reads TOML, and
+# tomllib is stdlib from 3.11. See PROVENANCE.md -- tightening the interpreter floor
+# was preferred to adding a `tomli` runtime dependency, because the dependency list
+# is the thing asserted verbatim against theirs.
+requires-python = ">=3.11"
 
 # Seeded verbatim from Neuronpedia's harness pyproject.toml at 93b8cae so this
 # list stays auditable against theirs. Any deviation goes in PROVENANCE.md --

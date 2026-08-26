@@ -81,11 +81,18 @@ Porting it would break the comparability the vendored copy was chosen for.
 
 ## Deviations from Neuronpedia's dependency set
 
-The seven runtime dependencies above are verbatim. Two deliberate differences in the
+The seven runtime dependencies above are verbatim. Three deliberate differences in the
 surrounding configuration:
 
 - **`pytest>=8.0` added as a `dev` extra.** Not a runtime dependency; does not affect
   a fit.
+- **`requires-python` tightened from `>=3.10` to `>=3.11`.** The machine profile
+  (`src/jlens_extensions/profile.py`) reads TOML, and `tomllib` is standard library
+  only from 3.11. The alternative was a `tomli` runtime dependency, which would have
+  broken the verbatim seven above — the list this file asserts is auditable against
+  theirs. Raising the interpreter floor is the cheaper deviation and costs nothing in
+  practice: the environment T3 resolved runs Python 3.12.3. Writing TOML is
+  hand-rolled in that module rather than taking `tomli-w`, for the same reason.
 - **Neuronpedia's `[[tool.uv.index]] pytorch-cu128` and `[tool.uv.sources] torch`
   routing is not carried over.** Their config routes `torch` to an explicit CUDA 12.8
   index under `sys_platform == 'linux'`, which selects the GB10 — but the GB10 is
