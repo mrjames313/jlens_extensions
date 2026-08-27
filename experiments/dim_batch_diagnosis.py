@@ -3,8 +3,38 @@
 Diagnostic, not a measurement. Written because `dim_batch_neutrality.py` returned a
 result that cannot be taken at face value.
 
-The contradiction
------------------
+Run 1 result, 2026-08-27, and why the question changed
+------------------------------------------------------
+
+**Uncompiled, everything is fine.** ``identity_distance`` is 0.5314-0.5315 at every
+``dim_batch``, matching T15's 0.531422 and the published tensor's 0.531418, and the
+Jacobian spread across ``dim_batch`` is 1e-2 to 2e-2 -- the same order as the forward's
+own batch-dependence, so roughly 1.6x amplification and nothing more.
+
+**Compiled, one configuration returned garbage**: ``identity_distance`` **8.41** at
+``dim_batch=8`` against an expected 0.53, with a uniform ~1.0 relative difference at every
+layer. Uniform-at-every-layer is not a ``dim_batch`` signature; it is one tensor being
+wrong and the others right. And the cause was printed alongside it::
+
+    torch._dynamo hit config.recompile_limit (8)
+    last reason: 0/7: KeyError on self._modules['linear_attn']
+
+Qwen3.5 is hybrid -- ``linear_attn`` state-space blocks with full attention every fourth
+layer -- so dynamo guards on the module dict and treats the two layer kinds as separate
+compile variants. Four ``dim_batch`` values on top of that exhausts a budget of 8.
+
+That run compiled several configurations in **one process**, which a real fit never does.
+So the anomaly may be an artifact of the diagnostic rather than of the fitter -- and which
+it is decides whether T15 stands.
+
+**The question is therefore no longer about `dim_batch`.** It is: *does `torch.compile`
+change the answer at a single configuration in a clean process?* Our fits run compiled, so
+if it does, T15, T16 and the envelope work are all suspect. Every configuration below now
+runs in its own process, and compiled-vs-uncompiled at the same `dim_batch` is the first
+comparison reported.
+
+The original contradiction
+--------------------------
 
 Fitting at ``dim_batch=64`` and comparing against our ``dim_batch=8`` pair gave per-layer
 relative Frobenius differences of **1.0 to 4.1** -- not a small numerical effect, but
@@ -162,86 +192,79 @@ def check_a_forward(model, prompt: str, batches: list[int]) -> dict:
             "worst": verdict}
 
 
-def check_bc_jacobian(prompt: str, batches: list[int], compile_model: bool) -> dict:
-    """Does one prompt's Jacobian depend on dim_batch?"""
+def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path) -> dict:
+    """One prompt's Jacobian at one configuration, in this process, saved to disk.
+
+    Saved rather than returned because each configuration runs in its own process --
+    see the module docstring for why that is not optional here.
+    """
     import torch
 
     from jlens.fitting import jacobian_for_prompt
 
-    tag = "compiled" if compile_model else "uncompiled"
-    print(f"\n=== Check {'B' if not compile_model else 'C'}: "
-          f"jacobian_for_prompt, {tag} ===")
     model = build(compile_model)
+    prompt = one_prompt()
     source_layers = list(range(model.n_layers - 1))
-    results = {}
-    for db in batches:
-        J, seq_len, n_valid = jacobian_for_prompt(
-            model, prompt, source_layers, target_layer=None,
-            dim_batch=db, max_seq_len=MAX_SEQ_LEN,
-        )
-        late = max(source_layers)
-        ident = (J[late].float() - torch.eye(D_MODEL)).norm().item() / D_MODEL**0.5
-        results[db] = {"J": {l: J[l].float() for l in source_layers}, "identity": ident}
-        print(f"  dim_batch={db:>4}: identity_distance={ident:.6f}  "
-              f"seq_len={seq_len} n_valid={n_valid}")
+    J, seq_len, n_valid = jacobian_for_prompt(
+        model, prompt, source_layers, target_layer=None,
+        dim_batch=dim_batch, max_seq_len=MAX_SEQ_LEN,
+    )
+    late = max(source_layers)
+    ident = (J[late].float() - torch.eye(D_MODEL)).norm().item() / D_MODEL**0.5
 
-    base = batches[0]
-    print(f"\n  per-layer difference vs dim_batch={base}:")
-    hdr = f"{'dim_batch':>10}" + "".join(f"{('L' + str(l)):>11}" for l in (0, 1, 2, 3, 11, 22))
-    print(hdr)
-    print("-" * len(hdr))
-    cross = {}
-    for db in batches[1:]:
-        per = {l: rel(results[db]["J"][l], results[base]["J"][l]) for l in source_layers}
-        cross[db] = per
-        print(f"{db:>10}" + "".join(f"{per[l]:>11.3e}" for l in (0, 1, 2, 3, 11, 22)))
+    recompiles = None
+    try:  # how close this configuration ran to the dynamo recompile ceiling
+        import torch._dynamo as dynamo
 
-    worst = max((max(v.values()) for v in cross.values()), default=0.0)
-    print(f"\n  VERDICT: Jacobian {'DIFFERS' if worst > 1e-3 else 'agrees'} across "
-          f"dim_batch when {tag} (worst {worst:.3e})")
+        recompiles = {"limit": dynamo.config.recompile_limit}
+    except Exception:  # noqa: BLE001 - diagnostics must not fail the diagnostic
+        pass
 
-    identities = {str(db): results[db]["identity"] for db in batches}
-    del results, model
-    torch.cuda.empty_cache()
-    return {"identity_distance": identities,
-            "cross": {str(k): {str(l): x for l, x in v.items()} for k, v in cross.items()},
-            "worst": worst}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({l: J[l].float() for l in source_layers}, str(out_path))
+    return {"dim_batch": dim_batch, "compile": compile_model,
+            "identity_distance": ident, "seq_len": seq_len, "n_valid": n_valid,
+            "path": str(out_path), "dynamo": recompiles}
 
 
 RESULT_PREFIX = "@@DIAG_RESULT@@ "
 
 
-def child(check: str, batches: list[int]) -> None:
-    """One check, one process. Emits its result as JSON on a marked line."""
-    prompt = one_prompt()
-    if check == "forward":
-        payload = check_a_forward(build(compile_model=False), prompt, batches)
-    elif check == "jac_uncompiled":
-        payload = check_bc_jacobian(prompt, batches, compile_model=False)
-    elif check == "jac_compiled":
-        payload = check_bc_jacobian(prompt, batches, compile_model=True)
+def child(args) -> None:
+    if args.child == "forward":
+        payload = check_a_forward(build(compile_model=False), one_prompt(),
+                                  [int(x) for x in args.dim_batches.split(",")])
+    elif args.child == "jacobian":
+        payload = compute_jacobian(args.dim_batch, args.compiled, Path(args.out))
     else:
-        raise SystemExit(f"unknown check {check!r}")
+        raise SystemExit(f"unknown check {args.child!r}")
     print(RESULT_PREFIX + json.dumps(payload, default=str), flush=True)
 
 
-def run_child(check: str, batches: list[int]) -> dict | None:
-    cmd = [sys.executable, str(Path(__file__).resolve()),
-           "--child", check, "--dim-batches", ",".join(str(b) for b in batches)]
+def run_child(label: str, extra: list[str], quiet: bool = False) -> dict | None:
+    cmd = [sys.executable, str(Path(__file__).resolve()), *extra]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     payload = None
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_PREFIX):
             payload = json.loads(line[len(RESULT_PREFIX):])
-        elif line.strip():
+        elif line.strip() and not quiet:
             print(line, flush=True)
+    if "recompile_limit" in proc.stderr:
+        print(f"  !! {label}: dynamo hit its recompile limit -- compiled output suspect")
     if payload is None:
-        tail = (proc.stderr or "<no stderr>").strip().splitlines()[-6:]
-        print(f"\n  !! check {check!r} produced no result (exit {proc.returncode}).")
+        tail = (proc.stderr or "<no stderr>").strip().splitlines()[-4:]
+        print(f"  !! {label} produced no result (exit {proc.returncode}):")
         for t in tail:
             print(f"     {t}")
-        print("     The other checks still ran; this one is missing rather than wrong.")
     return payload
+
+
+def rel_tensors(pa: str, pb: str) -> dict[int, float]:
+    import torch
+
+    A, B = torch.load(pa, map_location="cpu"), torch.load(pb, map_location="cpu")
+    return {l: rel(A[l], B[l]) for l in sorted(A)}
 
 
 def main() -> None:
@@ -249,80 +272,115 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dim-batches", default="8,16,32,64")
     parser.add_argument("--skip-forward", action="store_true")
-    parser.add_argument("--child", help="internal: run one check and emit JSON")
+    parser.add_argument("--keep", action="store_true", help="keep the saved Jacobians")
+    parser.add_argument("--child")
+    parser.add_argument("--dim-batch", type=int)
+    parser.add_argument("--compiled", action="store_true")
+    parser.add_argument("--out")
     args = parser.parse_args()
     batches = [int(x) for x in args.dim_batches.split(",") if x.strip()]
 
     if args.child:
-        child(args.child, batches)
+        child(args)
         return
 
     print(f"machine={cfg.machine}  model={MODEL_ID}  dim_batches={batches}")
-    print("One prompt. No fit. Reproduces what the 233-prompt run showed on its first prompt.")
-    print("Each check runs in a fresh subprocess; one failing does not lose the others.")
+    print("One prompt, no fit. Every configuration in its own process.")
+    print("\nThe question that matters: does torch.compile change the answer? Our fits")
+    print("run compiled, so if it does, T15 and everything downstream is suspect.")
 
+    scratch = cfg.scratch_root / "diag-jacobians"
     results: dict = {"task": "dim-batch-diagnosis", "machine": cfg.machine,
                      "model": MODEL_ID, "dim_batches": batches}
 
     if not args.skip_forward:
-        results["forward"] = run_child("forward", batches)
-    results["jacobian_uncompiled"] = run_child("jac_uncompiled", batches)
-    results["jacobian_compiled"] = run_child("jac_compiled", batches)
+        results["forward"] = run_child("forward", ["--child", "forward",
+                                                   "--dim-batches", args.dim_batches])
 
+    print("\n=== computing Jacobians, one process each ===")
+    meta: dict[tuple[int, bool], dict] = {}
+    for compiled in (False, True):
+        for db in batches:
+            tag = f"db{db}-{'c' if compiled else 'nc'}"
+            path = scratch / f"{tag}.pt"
+            extra = ["--child", "jacobian", "--dim-batch", str(db), "--out", str(path)]
+            if compiled:
+                extra.append("--compiled")
+            r = run_child(tag, extra, quiet=True)
+            if r:
+                meta[(db, compiled)] = r
+                print(f"  {tag:>10}: identity_distance={r['identity_distance']:.6f}")
+
+    results["configs"] = {f"db{db}-{'c' if c else 'nc'}": v for (db, c), v in meta.items()}
+
+    # --- The critical axis: does compile change the answer? -------------------
+    print("\n=== compiled vs uncompiled, SAME dim_batch ===")
+    print("Both sides identical except for torch.compile. Any difference here is compile.")
+    hdr = f"{'dim_batch':>10} {'identity nc':>13} {'identity c':>13} {'max rel diff':>14}"
+    print(hdr); print("-" * len(hdr))
+    compile_effect = {}
+    for db in batches:
+        if (db, False) not in meta or (db, True) not in meta:
+            continue
+        d = rel_tensors(meta[(db, False)]["path"], meta[(db, True)]["path"])
+        compile_effect[db] = d
+        print(f"{db:>10} {meta[(db, False)]['identity_distance']:>13.6f} "
+              f"{meta[(db, True)]['identity_distance']:>13.6f} {max(d.values()):>14.4e}")
+    results["compile_vs_uncompiled"] = {str(k): {str(l): x for l, x in v.items()}
+                                        for k, v in compile_effect.items()}
+
+    # --- dim_batch, within each compile setting -------------------------------
+    for compiled in (False, True):
+        tag = "compiled" if compiled else "uncompiled"
+        avail = [db for db in batches if (db, compiled) in meta]
+        if len(avail) < 2:
+            continue
+        base = avail[0]
+        print(f"\n=== dim_batch effect, {tag} (vs dim_batch={base}) ===")
+        hdr = f"{'dim_batch':>10}" + "".join(f"{('L' + str(l)):>11}" for l in (0, 3, 11, 22))
+        print(hdr); print("-" * len(hdr))
+        store = {}
+        for db in avail[1:]:
+            d = rel_tensors(meta[(base, compiled)]["path"], meta[(db, compiled)]["path"])
+            store[db] = d
+            print(f"{db:>10}" + "".join(f"{d[l]:>11.3e}" for l in (0, 3, 11, 22)))
+        results[f"dim_batch_{tag}"] = {str(k): {str(l): x for l, x in v.items()}
+                                       for k, v in store.items()}
+
+    # --- verdict --------------------------------------------------------------
     print("\n=== reading the result ===")
-    missing = [k for k in ("forward", "jacobian_uncompiled", "jacobian_compiled")
-               if results.get(k) is None]
-    if missing:
-        print(f"  incomplete: {missing} did not report. Read what follows with that in mind.")
+    worst_compile = max((max(v.values()) for v in compile_effect.values()), default=None)
     fwd = (results.get("forward") or {}).get("worst")
-    unc = (results.get("jacobian_uncompiled") or {}).get("worst")
-    com = (results.get("jacobian_compiled") or {}).get("worst")
-    for name, val in (("forward across batch sizes", fwd),
-                      ("Jacobian, uncompiled", unc),
-                      ("Jacobian, compiled", com)):
-        print(f"  {name:<27}: {val:.3e}" if val is not None else f"  {name:<27}: —")
-    # Run 1 established the forward differs at ~1e-2, which for bf16 accumulated over
-    # 24 blocks is ordinary kernel nondeterminism rather than a fault. So the open
-    # question is no longer "does the forward differ" but "does that explain the
-    # Jacobian" -- i.e. the amplification from one to the other.
-    if unc is None or com is None:
-        print("\n  -> cannot conclude; the compile branch needs both Jacobian checks.")
+    if worst_compile is None:
+        print("  compile axis did not complete; cannot conclude.")
+    elif worst_compile > 1e-2:
+        print(f"  compile changes the Jacobian by up to {worst_compile:.3e}.")
+        print("\n  -> TORCH.COMPILE IS NOT SAFE on this model, and our fits run compiled.")
+        print("     T15, T16 and the envelope work all used it. Before anything else is")
+        print("     believed, refit uncompiled and compare -- and note the dynamo warning")
+        print("     about recompile_limit and self._modules['linear_attn']: Qwen3.5 is")
+        print("     hybrid, so the two layer kinds are separate compile variants.")
     else:
-        if fwd:
-            print(f"\n  amplification, Jacobian / forward:")
-            print(f"    uncompiled {unc / fwd:>8.1f}x        compiled {com / fwd:>8.1f}x")
-        compile_effect = (com / unc) if unc else float("inf")
-        print(f"  compile changes the Jacobian difference by {compile_effect:.1f}x")
-
-        if unc < 1e-3 <= com:
-            print("\n  -> TORCH.COMPILE, and nothing else. The estimator is stable across")
-            print("     dim_batch uncompiled and unstable compiled, which is a")
-            print("     miscompilation. Our own compiled fits then need re-examining,")
-            print("     T15 included.")
-        elif unc >= 1e-3 and compile_effect > 10:
-            print("\n  -> BOTH. The forward difference propagates, and compile amplifies it")
-            print("     further. Separate them before concluding: the compiled path is the")
-            print("     one our fits actually use.")
-        elif unc >= 1e-3 and fwd and unc / fwd > 50:
-            print("\n  -> AMPLIFICATION IN THE JACOBIAN. The forward differs by an ordinary")
-            print("     bf16 margin, and the Jacobian magnifies it by orders of magnitude.")
-            print("     That is a conditioning property of the estimator on this model, not")
-            print("     a bug in it -- and it makes dim_batch load-bearing regardless of")
-            print("     what the criteria assume about disjoint rows.")
-        elif unc >= 1e-3:
-            print("\n  -> THE FORWARD, PROPAGATED. The Jacobian difference is the size the")
-            print("     forward difference predicts, so dim_batch is not neutral simply")
-            print("     because it sets the forward's batch size.")
-        else:
-            print("\n  -> NOT REPRODUCED at one prompt, despite the forward differing. The")
-            print("     233-prompt result then needs a different explanation; suspect the")
-            print("     fit driver or the artifacts rather than the estimator.")
+        print(f"  compile changes the Jacobian by at most {worst_compile:.3e} -- within the")
+        print(f"  bf16 batch-dependence the forward already shows"
+              f"{f' ({fwd:.3e})' if fwd else ''}.")
+        print("\n  -> COMPILE IS SAFE when one configuration is compiled per process, which")
+        print("     is what a real fit does. The earlier compiled anomaly came from")
+        print("     compiling several dim_batch values in one process and exhausting")
+        print("     dynamo's recompile budget. T15 is not implicated; the neutrality")
+        print("     probe's 233-prompt run still is, and needs re-running.")
 
     out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
     out.mkdir(parents=True, exist_ok=True)
     path = out / "dim_batch_diagnosis.json"
     path.write_text(json.dumps(results, indent=2, default=str) + "\n")
     print(f"\nwrote {path}")
+
+    if not args.keep:
+        import shutil
+
+        shutil.rmtree(scratch, ignore_errors=True)
+        print(f"removed {scratch} (pass --keep to retain the tensors)")
 
 
 if __name__ == "__main__":
