@@ -346,9 +346,15 @@ def layer_correspondence(
     """Negative control: does the metric put the *right* layer pairing first?
 
     A1 requires a control -- "a criterion that only ever sees agreement has not been
-    shown to be able to see disagreement". The criterion names a different model's
-    published lens, which is not available at this shape: no other published lens has
-    ``d_model=1024``, so a per-layer Frobenius comparison against one is undefined.
+    shown to be able to see disagreement". A control is a deliberate mismatch, fed to
+    the metric to check it returns a large number when it should.
+
+    The criterion nominates a different *model's* published lens for that role, which
+    is not computable here. Not because our model lacks one: Qwen3.5-0.8B's published
+    lens exists at ``d_model=1024`` and is the comparison target throughout. It is every
+    *other* published model that is a different width -- gpt2-small 768,
+    pythia-70m-deduped 512, qwen3-1.7b 2048 -- and ``||A - B||_F`` between different
+    shapes is undefined.
 
     This is the shape-safe equivalent, and a stronger test of the same thing. Compare
     every ``ours[i]`` against every ``reference[j]`` and check that ``j == i`` wins each

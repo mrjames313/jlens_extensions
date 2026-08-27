@@ -302,11 +302,14 @@ def main() -> None:
 
     # --- A1's required negative control --------------------------------------
     print("\n=== A1 control: can the metric see disagreement? ===")
-    print("A1 names a different model's published lens. That is undefined at this shape —")
-    print("no other published lens has d_model=1024 (nearest: gpt2-small 768, qwen3-1.7b")
-    print("2048), so a per-layer Frobenius against one cannot be computed. This is the")
-    print("shape-safe equivalent: match every one of our layers against every published")
-    print("layer and check the right pairing wins.")
+    print("A control is a deliberate mismatch, fed to the metric to prove it returns a")
+    print("large number when it should. Without one, the agreement above could equally")
+    print("be one file loaded twice, or a metric swamped by the near-identity diagonal.")
+    print("A1 nominates a different MODEL's lens as the mismatch. This model's own")
+    print("published lens is d_model=1024 and is what axis 1 uses; every other published")
+    print("model is a different width (gpt2-small 768, qwen3-1.7b 2048), and ||A-B||_F")
+    print("between different shapes is undefined. So: same principle, shape-safe —")
+    print("match every one of our layers against every published layer, right pair wins.")
     control = jx_cmp.layer_correspondence(a_J, p_J)
     hdr = (f"{'layer':>6} {'best match':>11} {'ok':>4} {'self':>12} {'runner-up':>10} "
            f"{'its score':>12} {'margin':>8}")
