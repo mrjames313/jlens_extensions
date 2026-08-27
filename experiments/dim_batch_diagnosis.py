@@ -46,6 +46,13 @@ Three candidates, and the three checks that tell them apart.
    sizes and the effect survives with compile off, it is in the backward or the row
    assembly. Check C maps the effect across ``dim_batch`` to locate a threshold.
 
+Each check runs in a **fresh subprocess**, which is T11's established pattern here and
+is load-bearing rather than tidy. Tearing a CUDA model down and building another in one
+process left the first run emitting ``cuBLAS ... there was no current CUDA context`` from
+inside the backward -- recoverable, but it means the process is no longer in the state the
+measurement assumes, and a diagnostic that cannot be trusted is worse than none. Separate
+processes also mean one check crashing does not lose the others.
+
 Cost: seconds to a couple of minutes. No fitting.
 
 Run::
@@ -59,6 +66,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -200,54 +208,115 @@ def check_bc_jacobian(prompt: str, batches: list[int], compile_model: bool) -> d
             "worst": worst}
 
 
+RESULT_PREFIX = "@@DIAG_RESULT@@ "
+
+
+def child(check: str, batches: list[int]) -> None:
+    """One check, one process. Emits its result as JSON on a marked line."""
+    prompt = one_prompt()
+    if check == "forward":
+        payload = check_a_forward(build(compile_model=False), prompt, batches)
+    elif check == "jac_uncompiled":
+        payload = check_bc_jacobian(prompt, batches, compile_model=False)
+    elif check == "jac_compiled":
+        payload = check_bc_jacobian(prompt, batches, compile_model=True)
+    else:
+        raise SystemExit(f"unknown check {check!r}")
+    print(RESULT_PREFIX + json.dumps(payload, default=str), flush=True)
+
+
+def run_child(check: str, batches: list[int]) -> dict | None:
+    cmd = [sys.executable, str(Path(__file__).resolve()),
+           "--child", check, "--dim-batches", ",".join(str(b) for b in batches)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    payload = None
+    for line in proc.stdout.splitlines():
+        if line.startswith(RESULT_PREFIX):
+            payload = json.loads(line[len(RESULT_PREFIX):])
+        elif line.strip():
+            print(line, flush=True)
+    if payload is None:
+        tail = (proc.stderr or "<no stderr>").strip().splitlines()[-6:]
+        print(f"\n  !! check {check!r} produced no result (exit {proc.returncode}).")
+        for t in tail:
+            print(f"     {t}")
+        print("     The other checks still ran; this one is missing rather than wrong.")
+    return payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dim-batches", default="8,16,32,64")
     parser.add_argument("--skip-forward", action="store_true")
+    parser.add_argument("--child", help="internal: run one check and emit JSON")
     args = parser.parse_args()
     batches = [int(x) for x in args.dim_batches.split(",") if x.strip()]
 
+    if args.child:
+        child(args.child, batches)
+        return
+
     print(f"machine={cfg.machine}  model={MODEL_ID}  dim_batches={batches}")
     print("One prompt. No fit. Reproduces what the 233-prompt run showed on its first prompt.")
-
-    prompt = one_prompt()
-    print(f"prompt: {len(prompt)} chars, starts {prompt[:60]!r}")
+    print("Each check runs in a fresh subprocess; one failing does not lose the others.")
 
     results: dict = {"task": "dim-batch-diagnosis", "machine": cfg.machine,
                      "model": MODEL_ID, "dim_batches": batches}
 
     if not args.skip_forward:
-        model = build(compile_model=False)
-        results["forward"] = check_a_forward(model, prompt, batches)
-        del model
-        import torch
-        torch.cuda.empty_cache()
-
-    results["jacobian_uncompiled"] = check_bc_jacobian(prompt, batches, compile_model=False)
-    results["jacobian_compiled"] = check_bc_jacobian(prompt, batches, compile_model=True)
+        results["forward"] = run_child("forward", batches)
+    results["jacobian_uncompiled"] = run_child("jac_uncompiled", batches)
+    results["jacobian_compiled"] = run_child("jac_compiled", batches)
 
     print("\n=== reading the result ===")
-    fwd = results.get("forward", {}).get("worst", 0.0)
-    unc = results["jacobian_uncompiled"]["worst"]
-    com = results["jacobian_compiled"]["worst"]
-    print(f"  forward across batch sizes : {fwd:.3e}")
-    print(f"  Jacobian, uncompiled       : {unc:.3e}")
-    print(f"  Jacobian, compiled         : {com:.3e}")
-    if fwd > 1e-3:
-        print("\n  -> THE MODEL. The replicated forward is batch-size dependent, so every")
-        print("     dim_batch gives a different Jacobian and the criteria's permission to")
-        print("     vary it is unsafe on this architecture.")
-    elif unc < 1e-3 <= com:
-        print("\n  -> TORCH.COMPILE. The estimator is fine uncompiled and wrong compiled at")
-        print("     some batch size. That is a miscompilation, and it would also mean our")
-        print("     own compiled fits need re-examining, T15 included.")
-    elif unc > 1e-3:
-        print("\n  -> THE ESTIMATOR. The forward agrees and compile is not implicated, so")
-        print("     the fault is in the backward or in row assembly.")
+    missing = [k for k in ("forward", "jacobian_uncompiled", "jacobian_compiled")
+               if results.get(k) is None]
+    if missing:
+        print(f"  incomplete: {missing} did not report. Read what follows with that in mind.")
+    fwd = (results.get("forward") or {}).get("worst")
+    unc = (results.get("jacobian_uncompiled") or {}).get("worst")
+    com = (results.get("jacobian_compiled") or {}).get("worst")
+    for name, val in (("forward across batch sizes", fwd),
+                      ("Jacobian, uncompiled", unc),
+                      ("Jacobian, compiled", com)):
+        print(f"  {name:<27}: {val:.3e}" if val is not None else f"  {name:<27}: —")
+    # Run 1 established the forward differs at ~1e-2, which for bf16 accumulated over
+    # 24 blocks is ordinary kernel nondeterminism rather than a fault. So the open
+    # question is no longer "does the forward differ" but "does that explain the
+    # Jacobian" -- i.e. the amplification from one to the other.
+    if unc is None or com is None:
+        print("\n  -> cannot conclude; the compile branch needs both Jacobian checks.")
     else:
-        print("\n  -> NOT REPRODUCED at one prompt. The 233-prompt result then needs a")
-        print("     different explanation; suspect the fit driver or the artifacts.")
+        if fwd:
+            print(f"\n  amplification, Jacobian / forward:")
+            print(f"    uncompiled {unc / fwd:>8.1f}x        compiled {com / fwd:>8.1f}x")
+        compile_effect = (com / unc) if unc else float("inf")
+        print(f"  compile changes the Jacobian difference by {compile_effect:.1f}x")
+
+        if unc < 1e-3 <= com:
+            print("\n  -> TORCH.COMPILE, and nothing else. The estimator is stable across")
+            print("     dim_batch uncompiled and unstable compiled, which is a")
+            print("     miscompilation. Our own compiled fits then need re-examining,")
+            print("     T15 included.")
+        elif unc >= 1e-3 and compile_effect > 10:
+            print("\n  -> BOTH. The forward difference propagates, and compile amplifies it")
+            print("     further. Separate them before concluding: the compiled path is the")
+            print("     one our fits actually use.")
+        elif unc >= 1e-3 and fwd and unc / fwd > 50:
+            print("\n  -> AMPLIFICATION IN THE JACOBIAN. The forward differs by an ordinary")
+            print("     bf16 margin, and the Jacobian magnifies it by orders of magnitude.")
+            print("     That is a conditioning property of the estimator on this model, not")
+            print("     a bug in it -- and it makes dim_batch load-bearing regardless of")
+            print("     what the criteria assume about disjoint rows.")
+        elif unc >= 1e-3:
+            print("\n  -> THE FORWARD, PROPAGATED. The Jacobian difference is the size the")
+            print("     forward difference predicts, so dim_batch is not neutral simply")
+            print("     because it sets the forward's batch size.")
+        else:
+            print("\n  -> NOT REPRODUCED at one prompt, despite the forward differing. The")
+            print("     233-prompt result then needs a different explanation; suspect the")
+            print("     fit driver or the artifacts rather than the estimator.")
 
     out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
     out.mkdir(parents=True, exist_ok=True)
