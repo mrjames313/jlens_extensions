@@ -16,9 +16,12 @@ flaky; the properties under test are exact, not statistical.
 """
 
 import pytest
-import torch
 
-from jlens_extensions.dictionary import (
+# Matches tests/test_harness_backports.py: skip rather than error at collection on a
+# machine without torch, so the rest of the suite still runs on a dev box.
+torch = pytest.importorskip("torch")
+
+from jlens_extensions.dictionary import (  # noqa: E402
     corrected_unembedding,
     dictionary_vectors,
     effective_gain,

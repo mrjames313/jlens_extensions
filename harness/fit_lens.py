@@ -253,6 +253,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="model dtype",
     )
     parser.add_argument(
+        "--save_dtype",
+        default="float16",
+        choices=("float16", "bfloat16", "float32"),
+        help=(
+            "precision the lens is STORED at (default: float16, the published "
+            "precision). Use float32 when two of our own lenses will be compared "
+            "against each other: fp16 storage floors any such comparison at ~5e-4, "
+            "which is the same order as the run-to-run noise being measured."
+        ),
+    )
+    parser.add_argument(
         "--hf_cache_dir",
         default=None,
         help=(
@@ -330,6 +341,11 @@ def main() -> None:
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[
         args.dtype
     ]
+    save_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[args.save_dtype]
 
     # Confine every HF download (weights + hub metadata) to the cache dir so it
     # can be wiped wholesale afterwards. Without this, downloads also leak into
@@ -399,7 +415,7 @@ def main() -> None:
             )
         finally:
             tracker.close()
-        lens.save(lens_path)
+        lens.save(lens_path, dtype=save_dtype)
 
         # The checkpoint only exists to resume an interrupted fit; once the lens
         # is saved it is dead weight, so drop it.

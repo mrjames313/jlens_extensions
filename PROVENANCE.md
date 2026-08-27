@@ -36,8 +36,8 @@ plus `LICENSE`, which Apache-2.0 §4(a) requires travel with the source.
 ## Changes to the vendored slice
 
 Four backports from upstream `anthropics/jacobian-lens` at `581d398`, applied on top of
-the byte-identical vendoring commit `4fc2167`. `git diff 4fc2167 -- harness/` is the
-permanent record of what we changed — no `patches/` directory to maintain, and no
+the byte-identical vendoring commit `4fc2167`, plus one addition of our own recorded
+below. `git diff 4fc2167 -- harness/` is the permanent record of what we changed — no `patches/` directory to maintain, and no
 reference checkout needed to answer "what did we change".
 
 | Item | File | What |
@@ -67,6 +67,31 @@ checkpoint as soon as the lens is saved, so a trailing write would be written an
 immediately unlinked — negligible at 0.8B, ~6.7 GB at 27B, and pure waste at both. If a
 caller ever wants a durable end-of-fit checkpoint, add the trailing call rather than
 reaching for `None`.
+
+### A fifth change, and it is ours rather than upstream's
+
+`--save_dtype` on `fit_lens.py` (T15, 2026-08-26). Not a backport — upstream has no such
+flag. Patch 4 above parameterised `JacobianLens.save`, but the driver still called it
+bare, so `fit_lens.py` could only ever write fp16 and the parameter was unreachable from
+the command line.
+
+**Behaviour-preserving at its default**, which is the same claim the four backports make:
+`--save_dtype` defaults to `float16`, the vendored and published precision, so a fit run
+without the flag writes exactly what it wrote before. Covered by
+`tests/test_harness_backports.py`.
+
+Why it was needed. T15 fits the same model twice and compares the pair, to measure the
+run-to-run envelope at the production configuration — T18 measured it uncompiled and said
+explicitly that it does not transfer. The ~5e-4 fp16 floor is a *single*-quantisation
+figure (fp16 machine epsilon is `2**-11 = 4.9e-4`, and the published lens is one
+quantised snapshot). Comparing two fp16 lenses draws that error twice, near `7e-4` — above
+T18's 7.5e-4 projection at L0 and far above every layer up the stack. An fp16 A/B would
+have measured its own storage quantisation.
+
+It does not weaken the comparison against the published artifact. Their side is fp16
+whatever we do, so storing ours at fp32 keeps that comparison at the stated single-draw
+~5e-4 instead of inflating it to ~7e-4, and fp32 can always be cast down where fp16
+cannot be recovered.
 
 **Deferred, with triggers.** `_check_layer_indices()` lands with the first patch that
 passes `source_layers` explicitly — expected before the 27B fit — so the guard arrives

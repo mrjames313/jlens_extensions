@@ -36,4 +36,5 @@ because those are large and machine-specific.
 | `t10_force_bos.py` | T10 | Whether `from_hf(force_bos=True)` changes the encoded ids on this tokenizer, or silently no-ops. |
 | `t11_dim_batch_sweep.py` | T11 | The `dim_batch` ceiling, per-prompt wall-clock and peak allocator memory, swept in fresh subprocesses. Projects the 233-prompt fit against T14's gate. |
 | `t12_diagnostic_cost.py` | T12 | The share of per-prompt wall-clock taken by `mean_rel_change` and `identity_distance`, by importing a text-patched copy of `fitting.py` from a temp dir. Never edits the repo. |
+| `t15_validation_fit.py` | T15 | The pinned 233-prompt validation fit, run twice sequentially at the production configuration. Reads `dim_batch` / `compile` from the machine profile, stores at fp32, and writes a provenance sidecar beside each lens. |
 | `t13_write_profile.py` | T13 | Assembles `$JLENS_ARTIFACT_ROOT/profiles/$JLENS_MACHINE.toml` from the T10/T11 measurement JSONs, fits the memory model, and reads it back through the path T15 uses. |

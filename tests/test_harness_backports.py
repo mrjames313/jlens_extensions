@@ -201,8 +201,13 @@ def test_default_mask_matches_the_published_position_count(jlens):
 
 
 def test_save_still_defaults_to_fp16(jlens, tmp_path):
-    """The published artifacts are fp16 and our comparison floor of ~5e-4 assumes
-    both sides are. Parameterising the dtype must not have moved the default."""
+    """The published artifacts are fp16 and matching them is the default's job.
+    Parameterising the dtype must not have moved it.
+
+    Note the ~5e-4 floor is a *single*-quantisation figure -- it is what remains
+    against a published lens however perfectly the fit is reproduced. Two fp16
+    lenses compared to each other draw it twice, nearer ~7e-4, which is why T15
+    stores at fp32. See ``experiments/t15_validation_fit.py``."""
     path = tmp_path / "lens.pt"
     lens = jlens.JacobianLens(
         jacobians={0: torch.eye(D_MODEL)}, n_prompts=1, d_model=D_MODEL
@@ -227,3 +232,59 @@ def test_save_honours_an_explicit_dtype(jlens, tmp_path):
     stored = torch.load(str(path), map_location="cpu", weights_only=True)
     assert stored["J"][0].dtype is torch.float32
     assert jlens.JacobianLens.load(str(path)).n_prompts == 1
+
+
+# --- Ours, not a backport: the --save_dtype CLI flag -------------------------
+#
+# Patch 4 parameterised `JacobianLens.save`, but `fit_lens.py` still called it
+# bare, so the driver could only ever write fp16. T15 fits the same model twice
+# and compares the pair, which at fp16 would be reading its own storage
+# quantisation. The flag exposes the parameter that already existed.
+
+
+@pytest.fixture
+def fit_lens(jlens):
+    """Import the vendored driver the way it imports itself, from `harness/`."""
+    sys.path.insert(0, str(HARNESS))
+    try:
+        yield importlib.import_module("fit_lens")
+    finally:
+        sys.path.remove(str(HARNESS))
+        sys.modules.pop("fit_lens", None)
+        importlib.invalidate_caches()
+
+
+def test_save_dtype_defaults_to_the_published_precision(fit_lens):
+    """Behaviour-preserving at its default, the same claim the four backports make:
+    an artifact-comparable fit run without the flag still writes fp16."""
+    args = fit_lens.build_parser().parse_args(["some-model"])
+
+    assert args.save_dtype == "float16"
+
+
+def test_save_dtype_is_independent_of_compute_dtype(fit_lens):
+    """The fit accumulates in fp32 and runs the model in bf16; storage is a third,
+    separate choice. Conflating it with --dtype would make fp32 storage require
+    an fp32 model, which does not fit."""
+    args = fit_lens.build_parser().parse_args(
+        ["some-model", "--dtype", "bfloat16", "--save_dtype", "float32"]
+    )
+
+    assert args.dtype == "bfloat16"
+    assert args.save_dtype == "float32"
+
+
+def test_save_dtype_rejects_an_unknown_precision(fit_lens):
+    with pytest.raises(SystemExit):
+        fit_lens.build_parser().parse_args(["some-model", "--save_dtype", "int8"])
+
+
+def test_save_dtype_reaches_lens_save(fit_lens):
+    """The flag has to be wired, not merely parsed -- `main()` must map it and pass
+    it through. Checked by source inspection: running main() needs a GPU."""
+    import inspect
+
+    source = inspect.getsource(fit_lens.main)
+
+    assert "save_dtype" in source
+    assert "lens.save(lens_path, dtype=save_dtype)" in source
