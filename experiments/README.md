@@ -34,6 +34,7 @@ later spec's numbering cannot collide with them.
 
 | Driver | Produces |
 |---|---|
+| `dim_batch_neutrality.py` | Whether `dim_batch` changes the fitted tensor, tested against T15's pair as a pure-noise null so the variable is isolated on one box. Reports per-layer excess over that null and whether it is depth-independent — the shape T16's unexplained residual has. |
 | `envelope_vs_n.py` | The run-to-run envelope against prompt count, at one fixed configuration (fp32, compiled, `dim_batch=8`), and a per-layer scaling exponent. Re-measures what T18 established through fp16 and at a different execution config. Gets six prompt counts out of a single 60-prompt pass by resuming the running sum. |
 
 ## Drivers
