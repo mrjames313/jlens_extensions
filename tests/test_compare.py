@@ -22,6 +22,7 @@ from jlens_extensions.compare import (  # noqa: E402
     binding_constraint,
     compare_lenses,
     fp16_roundtrip,
+    fit_power_law,
     fp16_storage_floor,
     identity_distance,
     identity_fraction,
@@ -372,3 +373,38 @@ def test_layer_correspondence_skips_mismatched_shapes():
     other = {0: torch.randn(16, 16)}
 
     assert layer_correspondence(ours, other)["rows"] == []
+
+
+# --- power-law fitting ------------------------------------------------------
+
+
+def test_fit_power_law_recovers_a_known_exponent():
+    points = [(n, 1e-3 * n ** -0.5) for n in (5, 10, 20, 40, 80)]
+    fit = fit_power_law(points)
+    assert fit["alpha"] == pytest.approx(0.5, abs=1e-9)
+    assert fit["C"] == pytest.approx(1e-3, rel=1e-9)
+    assert fit["r_squared"] == pytest.approx(1.0)
+
+
+def test_fit_power_law_recovers_systematic_noise_as_alpha_zero():
+    """Noise that does not average down at all is the alpha = 0 endpoint."""
+    assert fit_power_law([(n, 3.06e-3) for n in (5, 20, 60)])["alpha"] == pytest.approx(0.0)
+
+
+def test_fit_power_law_reports_a_poor_fit_rather_than_hiding_it():
+    """A single alpha must not be quoted for an envelope that is not scaling
+    cleanly, so r_squared is returned alongside it."""
+    fit = fit_power_law([(5, 1e-3), (10, 9e-4), (20, 5e-3), (40, 1e-4)])
+    assert fit["r_squared"] < 0.5
+
+
+def test_fit_power_law_needs_two_positive_points():
+    with pytest.raises(ValueError, match="at least two"):
+        fit_power_law([(20, 1e-3)])
+    with pytest.raises(ValueError, match="at least two"):
+        fit_power_law([(20, 1e-3), (40, 0.0)])
+
+
+def test_fit_power_law_rejects_a_degenerate_x_range():
+    with pytest.raises(ValueError, match="one prompt count"):
+        fit_power_law([(20, 1e-3), (20, 2e-3)])

@@ -395,3 +395,47 @@ def layer_correspondence(
         "min_margin_x": min(margins) if margins else None,
         "median_margin_x": sorted(margins)[len(margins) // 2] if margins else None,
     }
+
+
+def fit_power_law(points: Sequence[tuple[float, float]]) -> dict[str, Any]:
+    """Fit ``y = C * n**(-alpha)`` by least squares in log-log space.
+
+    The envelope between two fits is expected to fall with prompt count, because a
+    lens is a running *mean*: independent per-prompt noise averages down as
+    ``n**-0.5``, and perfectly systematic noise does not average down at all
+    (``alpha = 0``). Where a measured alpha sits between those two says how much of
+    the run-to-run difference is independent.
+
+    Args:
+        points: ``(n, envelope)`` pairs, at least two, all strictly positive.
+
+    Returns:
+        ``alpha``, ``C``, the ``r_squared`` of the log-log fit, and the points used.
+        ``r_squared`` matters here: a power law is an assumption, and a poor fit
+        means the envelope is not scaling cleanly and a single alpha should not be
+        quoted for it.
+    """
+    usable = [(n, y) for n, y in points if n > 0 and y > 0]
+    if len(usable) < 2:
+        raise ValueError(
+            f"need at least two positive (n, envelope) points to fit an exponent, "
+            f"got {len(usable)}"
+        )
+    xs = [math.log(n) for n, _ in usable]
+    ys = [math.log(y) for _, y in usable]
+    k = len(xs)
+    mx, my = sum(xs) / k, sum(ys) / k
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        raise ValueError("all points share one prompt count; cannot fit a slope")
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    intercept = my - slope * mx
+    ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    return {
+        "alpha": -slope,
+        "C": math.exp(intercept),
+        "r_squared": (1 - ss_res / ss_tot) if ss_tot > 0 else 1.0,
+        "n_points": k,
+        "points": usable,
+    }

@@ -27,6 +27,15 @@ because those are large and machine-specific.
 - **Outputs go to `$JLENS_ARTIFACT_ROOT/measurements/<task>/`** as JSON, so a
   write-up can be regenerated without a re-run.
 
+## Follow-on measurements
+
+Not spec tasks. Named for what they measure rather than given a task number, so a
+later spec's numbering cannot collide with them.
+
+| Driver | Produces |
+|---|---|
+| `envelope_vs_n.py` | The run-to-run envelope against prompt count, at one fixed configuration (fp32, compiled, `dim_batch=8`), and a per-layer scaling exponent. Re-measures what T18 established through fp16 and at a different execution config. Gets six prompt counts out of a single 60-prompt pass by resuming the running sum. |
+
 ## Drivers
 
 | Driver | Task | Produces |
