@@ -110,16 +110,26 @@ def read_deltas(csv_path: Path) -> tuple[list[float], list[dict]]:
     return deltas, rows
 
 
-def table(diffs, envelope=None, floor_label="") -> None:
+def table(diffs, envelope=None, fp16_floor=None) -> None:
+    """Print a per-layer table. With floors supplied, add the binding-floor verdict.
+
+    ``fp16_floor`` is a per-layer *measured* map, not the 2**-11 constant -- see
+    ``compare.fp16_storage_floor`` for why the constant is the wrong quantity here.
+    """
+    show = envelope is not None
     header = (f"{'layer':>6} {'rel_frobenius':>14} {'max_abs':>11} {'%differ':>8}"
-              + (f" {'floor':>11} {'binds':>15} {'x floor':>8}" if envelope is not None else ""))
+              + (f" {'floor':>11} {'binds':>15} {'x floor':>8}" if show else ""))
     print(header)
     print("-" * len(header))
     for d in diffs:
         line = (f"{d.layer:>6} {d.rel_frobenius:>14.4e} {d.max_abs:>11.3e} "
                 f"{d.frac_differing * 100:>7.1f}%")
-        if envelope is not None:
-            b = jx_cmp.binding_constraint(d.rel_frobenius, envelope=envelope.get(d.layer))
+        if show:
+            b = jx_cmp.binding_constraint(
+                d.rel_frobenius,
+                envelope=envelope.get(d.layer),
+                fp16_floor=(fp16_floor or {}).get(d.layer, jx_cmp.FP16_FLOOR),
+            )
             line += (f" {b['floor']:>11.3e} {b['binds']:>15} {b['ratio_to_floor']:>8.2f}"
                      + ("  ABOVE" if b["above_floor"] else ""))
         print(line)
@@ -188,15 +198,41 @@ def main() -> None:
         projs = f"{proj:>11.3e}" if proj else f"{'—':>11}"
         print(f"{d32.layer:>6} {d32.rel_frobenius:>13.4e} {d16.rel_frobenius:>15.4e} {projs} {ratio}")
 
+    # --- The floor, measured rather than assumed ------------------------------
+    print("\n=== The fp16 storage floor, measured on our own fp32 lens ===")
+    print("2**-11 = 4.883e-04 is the worst-case ELEMENT-WISE relative error. A per-layer")
+    print("comparison reports a Frobenius aggregate, where quantisation partly cancels.")
+    print("Scoring a difference against the element-wise bound flatters agreement.")
+    measured_floor = jx_cmp.fp16_storage_floor(a_J)
+    idfrac = jx_cmp.identity_fraction(p_J)
+    hdr = (f"{'layer':>6} {'measured fp16':>14} {'2**-11':>11} {'ratio':>7} "
+           f"{'||J-I||/||J||':>14}")
+    print(hdr)
+    print("-" * len(hdr))
+    for layer in sorted(measured_floor):
+        m = measured_floor[layer]
+        print(f"{layer:>6} {m:>14.4e} {jx_cmp.FP16_FLOOR:>11.3e} "
+              f"{m / jx_cmp.FP16_FLOOR:>7.2f} {idfrac[layer]:>14.4f}")
+    results["measured_fp16_floor"] = measured_floor
+    results["identity_fraction_published"] = idfrac
+    print("  The last column is how much of the norm is NOT the identity diagonal.")
+    print("  It rescales differences and floors alike, so it changes no ratio — it is")
+    print("  reported because the criteria ask whether the metric is washed out.")
+
     # --- Axis 1: ours vs published -------------------------------------------
     for label, J in ((a_label, a_J), (b_label, b_J)):
         print(f"\n=== Axis 1: run {label} vs published, per layer ===")
+        print("  floor = max(measured fp16 storage, measured a-vs-b envelope)")
         diffs = jx_cmp.compare_lenses(J, p_J)
-        table(diffs, envelope=envelope)
+        table(diffs, envelope=envelope, fp16_floor=measured_floor)
         above = [d.layer for d in diffs
                  if jx_cmp.binding_constraint(
-                     d.rel_frobenius, envelope=envelope.get(d.layer))["above_floor"]]
+                     d.rel_frobenius, envelope=envelope.get(d.layer),
+                     fp16_floor=measured_floor.get(d.layer, jx_cmp.FP16_FLOOR))["above_floor"]]
         print(f"  layers above their binding floor: {above or 'none'}")
+        worst = max(diffs, key=lambda d: d.rel_frobenius)
+        print(f"  A1 threshold is 1e-2 relative; worst layer is L{worst.layer} at "
+              f"{worst.rel_frobenius:.3e} = {worst.rel_frobenius / 1e-2:.1%} of it")
         results[f"axis1_vs_published_{label}"] = [d.as_dict() for d in diffs]
         results[f"axis1_above_floor_{label}"] = above
 
@@ -263,6 +299,32 @@ def main() -> None:
     print(f"  self-check, published trace: {pub_replay['would_stop_at']} "
           f"(should be {N_PROMPTS}; validates the replay against the run that used it)")
     results["recovered_early_stop"] = replay
+
+    # --- A1's required negative control --------------------------------------
+    print("\n=== A1 control: can the metric see disagreement? ===")
+    print("A1 names a different model's published lens. That is undefined at this shape —")
+    print("no other published lens has d_model=1024 (nearest: gpt2-small 768, qwen3-1.7b")
+    print("2048), so a per-layer Frobenius against one cannot be computed. This is the")
+    print("shape-safe equivalent: match every one of our layers against every published")
+    print("layer and check the right pairing wins.")
+    control = jx_cmp.layer_correspondence(a_J, p_J)
+    hdr = (f"{'layer':>6} {'best match':>11} {'ok':>4} {'self':>12} {'runner-up':>10} "
+           f"{'its score':>12} {'margin':>8}")
+    print(hdr)
+    print("-" * len(hdr))
+    for r in control["rows"]:
+        print(f"{r['layer']:>6} {r['best_match']:>11} {'yes' if r['correct'] else 'NO':>4} "
+              f"{r['self_score']:>12.4e} {str(r['runner_up']):>10} "
+              f"{r['runner_up_score']:>12.4e} {r['margin_x']:>8.1f}x")
+    verdict = "PASSES" if control["all_correct"] else "FAILS"
+    print(f"  control {verdict}: {control['n_correct']}/{control['n_layers']} layers "
+          f"matched themselves, min margin {control['min_margin_x']:.1f}x, "
+          f"median {control['median_margin_x']:.1f}x")
+    if not control["all_correct"]:
+        print("  A FAILING CONTROL VOIDS AXIS 1. The metric has not been shown able to")
+        print("  distinguish the right lens from a wrong one, so its agreement is not")
+        print("  evidence. Investigate before reading any verdict above.")
+    results["a1_control_layer_correspondence"] = control
 
     out_dir = cfg.artifact_root / "measurements" / "t16"
     out_dir.mkdir(parents=True, exist_ok=True)

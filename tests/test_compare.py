@@ -22,7 +22,10 @@ from jlens_extensions.compare import (  # noqa: E402
     binding_constraint,
     compare_lenses,
     fp16_roundtrip,
+    fp16_storage_floor,
     identity_distance,
+    identity_fraction,
+    layer_correspondence,
     rel_frobenius,
     replay_early_stop,
 )
@@ -274,3 +277,98 @@ def test_binding_constraint_flags_a_difference_under_the_floor():
     disagreement, it is resolution."""
     assert binding_constraint(1e-4, envelope=None)["above_floor"] is False
     assert binding_constraint(1e-2, envelope=None)["above_floor"] is True
+
+
+# --- measured storage floor -------------------------------------------------
+
+
+def test_fp16_storage_floor_is_smaller_than_the_elementwise_bound():
+    """The point of measuring it. 2**-11 is the worst-case *element-wise* relative
+    error; a Frobenius aggregate over a million entries partially cancels, so the
+    applicable floor is smaller -- and using the larger one flatters agreement."""
+    torch.manual_seed(0)
+    J = {0: torch.eye(64) + torch.randn(64, 64) * 0.5}
+
+    floor = fp16_storage_floor(J)[0]
+
+    assert 0.0 < floor < FP16_EPS
+
+
+def test_fp16_storage_floor_is_zero_for_an_exactly_representable_tensor():
+    """Powers of two survive fp16 exactly, so the floor is a property of the
+    distribution rather than a constant."""
+    assert fp16_storage_floor({0: torch.full((8, 8), 0.5)})[0] == 0.0
+
+
+def test_fp16_storage_floor_covers_every_layer():
+    torch.manual_seed(0)
+    J = {l: torch.randn(16, 16) for l in (0, 5, 22)}
+    assert sorted(fp16_storage_floor(J)) == [0, 5, 22]
+
+
+# --- identity fraction ------------------------------------------------------
+
+
+def test_identity_fraction_is_zero_for_the_identity_itself():
+    assert identity_fraction({0: torch.eye(32)})[0] == pytest.approx(0.0)
+
+
+def test_identity_fraction_reports_the_deviation_share():
+    """A near-identity Jacobian carries most of its Frobenius norm in the diagonal;
+    this is the number that says how much."""
+    J = torch.eye(32) * 1.0
+    J[0, 1] = 1.0  # one off-diagonal unit
+    frac = identity_fraction({0: J})[0]
+    # ||J - I|| = 1, ||J|| = sqrt(32 + 1)
+    assert frac == pytest.approx(1.0 / math.sqrt(33))
+
+
+# --- the negative control ---------------------------------------------------
+
+
+def test_layer_correspondence_puts_the_diagonal_first_on_distinct_layers():
+    """The control passing: each layer matches itself, by a wide margin."""
+    torch.manual_seed(0)
+    ours = {l: torch.randn(32, 32) for l in range(5)}
+    ref = {l: v + torch.randn(32, 32) * 1e-4 for l, v in ours.items()}
+
+    result = layer_correspondence(ours, ref)
+
+    assert result["all_correct"]
+    assert result["n_correct"] == 5
+    assert result["min_margin_x"] > 100
+
+
+def test_layer_correspondence_detects_a_shifted_reference():
+    """The control failing, which is what makes it a control: a lens whose layers
+    are off by one is flagged rather than passed."""
+    torch.manual_seed(0)
+    base = {l: torch.randn(32, 32) for l in range(5)}
+    ours = {l: base[l] for l in range(4)}
+    shifted = {l: base[l + 1] for l in range(4)}
+
+    result = layer_correspondence(ours, shifted)
+
+    assert not result["all_correct"]
+    assert result["n_correct"] == 0
+
+
+def test_layer_correspondence_would_flatten_on_near_identity_tensors():
+    """The 'both tensors near-identity' failure the criteria name: if the metric
+    were dominated by the identity diagonal, every layer would match every other
+    equally well and the margin would collapse toward 1."""
+    ours = {l: torch.eye(64) + torch.randn(64, 64) * 1e-6 for l in range(4)}
+    ref = {l: torch.eye(64) + torch.randn(64, 64) * 1e-6 for l in range(4)}
+
+    result = layer_correspondence(ours, ref)
+
+    assert result["min_margin_x"] < 2.0, "margin should collapse when signal is absent"
+
+
+def test_layer_correspondence_skips_mismatched_shapes():
+    """A different model's lens has a different d_model, which is why the criterion's
+    literal cross-model control is undefined at this shape."""
+    ours = {0: torch.randn(32, 32)}
+    other = {0: torch.randn(16, 16)}
+
+    assert layer_correspondence(ours, other)["rows"] == []

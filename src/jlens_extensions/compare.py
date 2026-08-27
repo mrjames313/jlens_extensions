@@ -287,3 +287,105 @@ def binding_constraint(
         "ratio_to_floor": rel_diff / floor if floor else float("inf"),
         "above_floor": rel_diff > floor,
     }
+
+
+def fp16_storage_floor(jacobians: Mapping[int, Any]) -> dict[int, float]:
+    """Per-layer fp16 storage floor, **measured** rather than derived.
+
+    The ~4.9e-4 figure quoted throughout is ``2**-11``, fp16's machine epsilon: the
+    worst-case *element-wise* relative error. A per-layer comparison reports a
+    *Frobenius-aggregate* relative difference, which is a different and smaller
+    quantity -- quantisation errors are spread over a million entries and partially
+    cancel, and how much they cancel depends on the distribution of ``J``'s entries.
+
+    Using the element-wise bound as if it were the aggregate floor is conservative in
+    the direction that matters: it makes agreement look better than it is, because a
+    difference is scored against a floor larger than the one that actually applies.
+
+    This measures it instead. Round-trip our own fp32 lens through fp16 and take
+    ``||J - fp16(J)||_F / ||J||_F`` per layer -- exactly the operation the published
+    artifact underwent, on a tensor with the right distribution.
+
+    One draw, not two. The published lens is quantised and ours (at fp32) is not, so
+    a ours-vs-published comparison carries exactly one of these. Two fp16 lenses
+    compared to each other carry ~sqrt(2) of it.
+    """
+    return {
+        layer: (J - fp16_roundtrip(J)).norm().item() / J.norm().item()
+        for layer, J in sorted(jacobians.items())
+    }
+
+
+def identity_fraction(jacobians: Mapping[int, Any]) -> dict[int, float]:
+    """Per-layer ``||J - I||_F / ||J||_F`` -- how much of the norm is *not* the identity.
+
+    A Jacobian through a residual stream is near-identity, so a difference normalised
+    by ``||J||`` is normalised largely by the identity diagonal. This reports how much
+    of the norm carries actual signal, so a reader can rescale to the deviation if they
+    want the more demanding view.
+
+    It does **not** change any verdict on its own: the storage floor and the run-to-run
+    envelope are both normalised the same way, so a difference and its floor rescale
+    together and their ratio is invariant. It is reported because "is this metric being
+    washed out by the identity?" is a question the criteria explicitly raise, and the
+    answer should be a number rather than an argument.
+    """
+    import torch
+
+    out = {}
+    for layer, J in sorted(jacobians.items()):
+        d = J.shape[0]
+        out[layer] = (J - torch.eye(d, dtype=J.dtype)).norm().item() / J.norm().item()
+    return out
+
+
+def layer_correspondence(
+    ours: Mapping[int, Any],
+    reference: Mapping[int, Any],
+) -> dict[str, Any]:
+    """Negative control: does the metric put the *right* layer pairing first?
+
+    A1 requires a control -- "a criterion that only ever sees agreement has not been
+    shown to be able to see disagreement". The criterion names a different model's
+    published lens, which is not available at this shape: no other published lens has
+    ``d_model=1024``, so a per-layer Frobenius comparison against one is undefined.
+
+    This is the shape-safe equivalent, and a stronger test of the same thing. Compare
+    every ``ours[i]`` against every ``reference[j]`` and check that ``j == i`` wins each
+    row. It rules out the three failure modes the criterion names -- a wrong file loaded,
+    two near-identity tensors matching trivially, a normalisation that washes the
+    difference out -- because all three would flatten this grid, and it additionally
+    verifies the layer indexing, which a cross-model comparison cannot.
+
+    Returns the per-row winner, the margin over the runner-up, and whether the diagonal
+    won everywhere.
+    """
+    layers = sorted(ours)
+    rows = []
+    for i in layers:
+        scores = {j: rel_frobenius(ours[i], reference[j]) for j in sorted(reference)
+                  if reference[j].shape == ours[i].shape}
+        if not scores:
+            continue
+        ranked = sorted(scores, key=lambda j: scores[j])
+        best, runner = ranked[0], (ranked[1] if len(ranked) > 1 else None)
+        rows.append({
+            "layer": i,
+            "best_match": best,
+            "correct": best == i,
+            "self_score": scores.get(i),
+            "best_score": scores[best],
+            "runner_up": runner,
+            "runner_up_score": scores[runner] if runner is not None else None,
+            "margin_x": (scores[runner] / scores[best]) if runner is not None and scores[best] else None,
+        })
+    correct = [r for r in rows if r["correct"]]
+    margins = [r["margin_x"] for r in rows if r["margin_x"] is not None]
+    return {
+        "rows": rows,
+        "n_layers": len(rows),
+        "n_correct": len(correct),
+        "all_correct": len(correct) == len(rows) and bool(rows),
+        "min_margin_x": min(margins) if margins else None,
+        "median_margin_x": sorted(margins)[len(margins) // 2] if margins else None,
+    }
