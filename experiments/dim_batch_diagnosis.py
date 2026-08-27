@@ -23,9 +23,27 @@ Qwen3.5 is hybrid -- ``linear_attn`` state-space blocks with full attention ever
 layer -- so dynamo guards on the module dict and treats the two layer kinds as separate
 compile variants. Four ``dim_batch`` values on top of that exhausts a budget of 8.
 
-That run compiled several configurations in **one process**, which a real fit never does.
-So the anomaly may be an artifact of the diagnostic rather than of the fitter -- and which
-it is decides whether T15 stands.
+Run 2 repeated it with each *check* in its own process and reproduced it: compiled
+``dim_batch=8`` gave 7.83 again. So it is not cross-check contamination. But that run
+still compiled all four ``dim_batch`` values inside the Check C process, and the pattern
+across them is monotonic in the number of **retained-graph backward passes** rather than
+in slicing width::
+
+    dim_batch   backward passes   identity_distance
+        8            128              7.826707     garbage
+       16             64              0.545104     off by 2.6%
+       32             32              0.531534     correct
+       64             16              0.531402     correct
+
+Which is where it stops adding up. T15 ran **compiled at dim_batch=8** -- 128 passes, the
+worst cell -- over 233 prompts, twice, and produced 0.531422 both times, matching the
+published tensor to 1.4e-3. A deterministically broken configuration cannot do that.
+
+The one thing neither run isolated: **a real fit compiles exactly one `dim_batch`.** Both
+diagnostics compiled four in the same process, which is precisely the condition that
+exhausts dynamo's recompile budget on a hybrid model. So the remaining hypothesis is that
+the breakage is caused by the diagnostic's own multiplicity, not by compile per se -- and
+that decides whether T15 stands.
 
 **The question is therefore no longer about `dim_batch`.** It is: *does `torch.compile`
 change the answer at a single configuration in a clean process?* Our fits run compiled, so
@@ -273,6 +291,8 @@ def main() -> None:
     parser.add_argument("--dim-batches", default="8,16,32,64")
     parser.add_argument("--skip-forward", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the saved Jacobians")
+    parser.add_argument("--repeat", type=int, default=2,
+                        help="runs per configuration, for the reproducibility null (default 2)")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compiled", action="store_true")
@@ -297,21 +317,55 @@ def main() -> None:
         results["forward"] = run_child("forward", ["--child", "forward",
                                                    "--dim-batches", args.dim_batches])
 
-    print("\n=== computing Jacobians, one process each ===")
-    meta: dict[tuple[int, bool], dict] = {}
+    print("\n=== computing Jacobians, ONE configuration per process ===")
+    print("This is what the previous run did not isolate: it compiled four dim_batch")
+    print("values in a single process. A real fit compiles exactly one.")
+    print(f"Each configuration runs {args.repeat}x, so within-configuration reproducibility")
+    print("is measured rather than assumed -- without it the compile number has no null.")
+    meta: dict[tuple[int, bool, int], dict] = {}
     for compiled in (False, True):
         for db in batches:
-            tag = f"db{db}-{'c' if compiled else 'nc'}"
-            path = scratch / f"{tag}.pt"
-            extra = ["--child", "jacobian", "--dim-batch", str(db), "--out", str(path)]
-            if compiled:
-                extra.append("--compiled")
-            r = run_child(tag, extra, quiet=True)
-            if r:
-                meta[(db, compiled)] = r
-                print(f"  {tag:>10}: identity_distance={r['identity_distance']:.6f}")
+            for rep in range(args.repeat):
+                tag = f"db{db}-{'c' if compiled else 'nc'}-r{rep}"
+                path = scratch / f"{tag}.pt"
+                extra = ["--child", "jacobian", "--dim-batch", str(db), "--out", str(path)]
+                if compiled:
+                    extra.append("--compiled")
+                r = run_child(tag, extra, quiet=True)
+                if r:
+                    meta[(db, compiled, rep)] = r
+                    print(f"  {tag:>14}: identity_distance={r['identity_distance']:.6f}")
 
-    results["configs"] = {f"db{db}-{'c' if c else 'nc'}": v for (db, c), v in meta.items()}
+    results["configs"] = {f"db{db}-{'c' if c else 'nc'}-r{r_}": v
+                          for (db, c, r_), v in meta.items()}
+
+    # --- The null: does one configuration reproduce itself? -------------------
+    if args.repeat > 1:
+        print("\n=== within-configuration reproducibility (the null) ===")
+        hdr = f"{'config':>14} {'identity r0':>13} {'identity r1':>13} {'max rel diff':>14}"
+        print(hdr); print("-" * len(hdr))
+        selfdiff = {}
+        for compiled in (False, True):
+            for db in batches:
+                if (db, compiled, 0) not in meta or (db, compiled, 1) not in meta:
+                    continue
+                tag = f"db{db}-{'c' if compiled else 'nc'}"
+                d = rel_tensors(meta[(db, compiled, 0)]["path"],
+                                meta[(db, compiled, 1)]["path"])
+                selfdiff[tag] = max(d.values())
+                print(f"{tag:>14} {meta[(db, compiled, 0)]['identity_distance']:>13.6f} "
+                      f"{meta[(db, compiled, 1)]['identity_distance']:>13.6f} "
+                      f"{selfdiff[tag]:>14.4e}")
+        results["self_reproducibility"] = selfdiff
+        flaky = {k: v for k, v in selfdiff.items() if v > 1e-2}
+        if flaky:
+            print(f"\n  !! these do not reproduce themselves: {sorted(flaky)}")
+            print("     A configuration that differs from ITSELF across two identical runs")
+            print("     is nondeterministic, not merely different -- and no comparison")
+            print("     against it means anything until that is understood.")
+
+    # Collapse to r0 for the remaining comparisons.
+    meta = {(db, c): v for (db, c, r_), v in meta.items() if r_ == 0}
 
     # --- The critical axis: does compile change the answer? -------------------
     print("\n=== compiled vs uncompiled, SAME dim_batch ===")
