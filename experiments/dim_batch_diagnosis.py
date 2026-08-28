@@ -132,6 +132,14 @@ MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
 D_MODEL = 1024
 
+#: Prompt-1 identity_distance for this model on this corpus, from runs independently
+#: corroborated against Neuronpedia's published lens. Compiled sound runs give
+#: 0.53127-0.53130 and uncompiled 0.531523; the miscompiled modes give ~0.5435 (subtle)
+#: or 5-8 (catastrophic). This is the cheapest validity gate available -- every fit
+#: writes it to row 1 of its convergence CSV.
+EXPECTED_IDENTITY = 0.5314
+IDENTITY_TOL = 0.01
+
 
 def rel(a, b) -> float:
     n = b.norm().item()
@@ -543,26 +551,40 @@ def main() -> None:
                   f"{r['identity_distance']:>13.6f} {'~0.5314':>11}")
     results["via_fit"] = viafit
 
-    disagree = {t: (meta[(int(t.split('-')[0][2:]), t.endswith('-c'))]['identity_distance'],
-                    v['identity_distance'])
-                for t, v in viafit.items()}
-    split = {t: (d, f) for t, (d, f) in disagree.items() if abs(d - f) > 0.05}
-    if split:
-        print("\n  These differ between the two call paths:")
-        for t, (d, f) in sorted(split.items()):
-            print(f"    {t}: direct {d:.6f}, via fit() {f:.6f}")
-        if all(abs(f - 0.5314) < 0.05 for _, f in split.values()):
-            print("\n  -> THE DIRECT CALL IS THE BROKEN ONE. Every via-fit() result is correct,")
-            print("     so the estimator and torch.compile are both fine as our fits use them.")
-            print("     T15, T16 and the envelope work stand. What needs explaining is why a")
-            print("     bare jacobian_for_prompt call misbehaves -- a real bug, but in a path")
-            print("     nothing we have produced depends on.")
-        else:
-            print("\n  -> BOTH PATHS ARE AFFECTED. Our fits are implicated; refit uncompiled")
-            print("     and compare before anything downstream is believed.")
+    # Judge EVERY via-fit result against the expected value, not only those that
+    # disagree with their direct counterpart. The previous logic filtered to configs
+    # where the two paths differed by >0.05 and then asked whether that subset was
+    # correct -- so a via-fit result that was wrong in the same way as its direct
+    # counterpart, or wrong by a subtle 2%, was never examined at all. It concluded
+    # "every via-fit result is correct" from a set of one.
+    print("\n  every via-fit result against the expected value:")
+    bad_viafit = {}
+    for tag, r in sorted(viafit.items()):
+        ident = r["identity_distance"]
+        off = abs(ident - EXPECTED_IDENTITY) / EXPECTED_IDENTITY
+        flag = "" if off <= IDENTITY_TOL else ("  <- SUBTLE" if off < 0.5 else "  <- CATASTROPHIC")
+        if off > IDENTITY_TOL:
+            bad_viafit[tag] = ident
+        print(f"    {tag:>12} {ident:>12.6f}  {off:>8.2%} off{flag}")
+    results["via_fit_bad"] = bad_viafit
+
+    if bad_viafit:
+        print(f"\n  -> COMPILE IS NOT SAFE, INCLUDING THROUGH fit(). {sorted(bad_viafit)}")
+        print("     came back wrong on the path our fits actually take, so the earlier")
+        print("     reading that only the direct call was affected does not hold.")
+        print("     Note the two severities: a catastrophic mode (identity 5-8, obviously")
+        print("     wrong) and a subtle one (~0.5435, 2.3% high) that looks plausible and")
+        print("     would pass unnoticed. The subtle mode is the dangerous one.")
     else:
-        print("\n  The two call paths agree everywhere. The breakage is then reproducible")
-        print("  through fit() too, and our fits are implicated.")
+        print("\n  -> every via-fit result is correct. On this evidence the fit() path is")
+        print("     sound, though the direct-call failure remains a real bug.")
+
+    print("\n=== the validity gate this implies ===")
+    print(f"  A sound run has prompt-1 identity_distance within {IDENTITY_TOL:.0%} of")
+    print(f"  {EXPECTED_IDENTITY:.6f} for this model and corpus. Every fit already writes")
+    print("  that number to row 1 of its *_convergence.csv, so it is a retroactive check")
+    print("  on every lens we have ever produced, at zero cost. Check it before trusting")
+    print("  any fit, and refit uncompiled if a lens matters and cannot be re-verified.")
 
     out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
     out.mkdir(parents=True, exist_ok=True)
