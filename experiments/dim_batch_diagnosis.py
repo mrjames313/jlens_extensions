@@ -361,6 +361,72 @@ def rel_tensors(pa: str, pb: str) -> dict[int, float]:
     return {l: rel(A[l], B[l]) for l in sorted(A)}
 
 
+def classify(ident: float) -> str:
+    """Severity of one run's identity_distance against the known-good value."""
+    off = abs(ident - EXPECTED_IDENTITY) / EXPECTED_IDENTITY
+    if off <= IDENTITY_TOL:
+        return "ok"
+    return "subtle" if off < 0.5 else "catastrophic"
+
+
+def soak(dim_batch: int, reps: int, scratch: Path) -> dict:
+    """Repeat ONE configuration many times on both call paths, and count failures.
+
+    The question this settles. At compiled ``dim_batch=8`` the direct call has failed
+    5 of 6 observations, while the ``fit()`` path is 5 for 5 clean -- T15's two runs,
+    two envelope prompt-1s, and one via-fit. If both paths carried the same risk, five
+    clean draws in a row would be about a 0.01% event, so they probably differ. But
+    those five are heterogeneous (two 233-prompt finals, two first prompts, one single
+    prompt) and n=5 is thin for a claim this load-bearing: it decides whether every
+    lens we hold was produced by a path that intermittently corrupts them.
+
+    So: same configuration, same process isolation, both paths, many draws, counted.
+    """
+    out: dict[str, list] = {"direct": [], "fit": []}
+    for path_name, child_mode in (("direct", "jacobian"), ("fit", "via_fit")):
+        for rep in range(reps):
+            tag = f"soak-db{dim_batch}-{path_name}-r{rep}"
+            dest = scratch / f"{tag}.pt"
+            r = run_child(tag, ["--child", child_mode, "--dim-batch", str(dim_batch),
+                                "--compiled", "--out", str(dest)], quiet=True)
+            if r:
+                out[path_name].append(r["identity_distance"])
+            dest.unlink(missing_ok=True)
+
+    print(f"\n=== soak at compiled dim_batch={dim_batch}, {reps} draws per path ===")
+    hdr = f"{'path':>8} {'n':>4} {'ok':>4} {'subtle':>7} {'catastrophic':>13}  {'failure rate':>13}"
+    print(hdr); print("-" * len(hdr))
+    summary = {}
+    for path_name, vals in out.items():
+        kinds = [classify(v) for v in vals]
+        n = len(vals)
+        ok = kinds.count("ok")
+        sub = kinds.count("subtle")
+        cat = kinds.count("catastrophic")
+        rate = (n - ok) / n if n else float("nan")
+        summary[path_name] = {"n": n, "ok": ok, "subtle": sub, "catastrophic": cat,
+                              "failure_rate": rate, "values": vals}
+        print(f"{path_name:>8} {n:>4} {ok:>4} {sub:>7} {cat:>13}  {rate:>12.0%}")
+
+    d, f = summary.get("direct", {}), summary.get("fit", {})
+    if d.get("n") and f.get("n"):
+        print()
+        if f["failure_rate"] == 0 and d["failure_rate"] > 0.5:
+            print(f"  -> THE fit() PATH IS MATERIALLY SAFER. {f['n']}/{f['n']} clean against")
+            print(f"     {d['ok']}/{d['n']} on the direct call. Our fits take the fit() path,")
+            print(f"     so the lenses we hold are not produced by the failing route -- but")
+            print(f"     'safer' is not 'safe', and {f['n']} draws bounds the rate at roughly")
+            print(f"     1-in-{f['n']}, not at zero. Keep the prompt-1 gate on every fit.")
+        elif f["failure_rate"] > 0:
+            print(f"  -> BOTH PATHS FAIL. fit() at {f['failure_rate']:.0%}, direct at"
+                  f" {d['failure_rate']:.0%}. Every compiled lens we hold is a coin flip,")
+            print(f"     and the only safe course is refitting uncompiled.")
+        else:
+            print(f"  -> Neither path failed in {f['n']} draws. That contradicts the earlier")
+            print(f"     observations and needs explaining before it is trusted.")
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -369,6 +435,11 @@ def main() -> None:
     parser.add_argument("--keep", action="store_true", help="keep the saved Jacobians")
     parser.add_argument("--repeat", type=int, default=2,
                         help="runs per configuration, for the reproducibility null (default 2)")
+    parser.add_argument("--soak", type=int, metavar="REPS",
+                        help="skip the matrix; repeat ONE dim_batch on both call paths "
+                             "REPS times and count failures")
+    parser.add_argument("--soak-dim-batch", type=int, default=8,
+                        help="which dim_batch to soak (default 8, T15's setting)")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compiled", action="store_true")
@@ -378,6 +449,22 @@ def main() -> None:
 
     if args.child:
         child(args)
+        return
+
+    scratch_early = cfg.scratch_root / "diag-jacobians"
+    if args.soak:
+        print(f"machine={cfg.machine}  model={MODEL_ID}")
+        print(f"Soak: compiled dim_batch={args.soak_dim_batch}, {args.soak} draws per path,")
+        print(f"each in its own process. ~{2 * args.soak * 45 // 60} minutes.")
+        res = soak(args.soak_dim_batch, args.soak, scratch_early)
+        out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"soak_db{args.soak_dim_batch}.json").write_text(
+            json.dumps({"task": "compile-soak", "machine": cfg.machine,
+                        "dim_batch": args.soak_dim_batch, "reps": args.soak,
+                        "expected_identity": EXPECTED_IDENTITY,
+                        "summary": res}, indent=2, default=str) + "\n")
+        print(f"\nwrote {out / f'soak_db{args.soak_dim_batch}.json'}")
         return
 
     print(f"machine={cfg.machine}  model={MODEL_ID}  dim_batches={batches}")
