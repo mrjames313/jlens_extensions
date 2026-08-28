@@ -116,6 +116,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -259,22 +260,51 @@ def child(args) -> None:
     print(RESULT_PREFIX + json.dumps(payload, default=str), flush=True)
 
 
+#: Per-child ceiling. A child that exceeds this is killed and reported rather than
+#: hanging the run: the longest legitimate child is a cold compile plus 128 backward
+#: passes, which T11 measured at well under two minutes.
+CHILD_TIMEOUT_S = 900
+
+
 def run_child(label: str, extra: list[str], quiet: bool = False) -> dict | None:
+    """Run one child to completion, announcing it first.
+
+    ``capture_output=True`` means nothing the child prints is visible until it exits,
+    so without the announcement below a two-minute compile looks like a hang. The
+    announcement is flushed explicitly because this output is usually piped to a log,
+    where Python block-buffers and an unflushed line would not appear either.
+    """
     cmd = [sys.executable, str(Path(__file__).resolve()), *extra]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"  -> {label} ... ", end="", flush=True)
+    started = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=CHILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"TIMED OUT after {CHILD_TIMEOUT_S}s", flush=True)
+        print(f"     killed. The other configurations still run; this one is missing.",
+              flush=True)
+        return None
+    elapsed = time.time() - started
+
     payload = None
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_PREFIX):
             payload = json.loads(line[len(RESULT_PREFIX):])
         elif line.strip() and not quiet:
-            print(line, flush=True)
-    if "recompile_limit" in proc.stderr:
-        print(f"  !! {label}: dynamo hit its recompile limit -- compiled output suspect")
+            print(f"\n{line}", end="", flush=True)
+
     if payload is None:
-        tail = (proc.stderr or "<no stderr>").strip().splitlines()[-4:]
-        print(f"  !! {label} produced no result (exit {proc.returncode}):")
-        for t in tail:
-            print(f"     {t}")
+        print(f"NO RESULT after {elapsed:.0f}s (exit {proc.returncode})", flush=True)
+        for t in (proc.stderr or "<no stderr>").strip().splitlines()[-4:]:
+            print(f"     {t}", flush=True)
+    else:
+        note = ""
+        if "recompile_limit" in (proc.stderr or ""):
+            note = "  !! dynamo hit its recompile limit -- output suspect"
+            payload["dynamo_limit_hit"] = True
+        ident = payload.get("identity_distance")
+        detail = f"identity_distance={ident:.6f}  " if ident is not None else ""
+        print(f"{detail}({elapsed:.0f}s){note}", flush=True)
     return payload
 
 
@@ -317,7 +347,12 @@ def main() -> None:
         results["forward"] = run_child("forward", ["--child", "forward",
                                                    "--dim-batches", args.dim_batches])
 
-    print("\n=== computing Jacobians, ONE configuration per process ===")
+    n_children = 2 * len(batches) * args.repeat
+    print(f"\n=== computing Jacobians, ONE configuration per process ===")
+    print(f"{n_children} child processes. Each loads the model and compiles from scratch,")
+    print(f"so expect roughly 60-120s per child -- the first is slowest on a cold inductor")
+    print(f"cache (T11 measured 81.8s there). Total on the order of {n_children * 90 // 60} minutes.")
+    print(f"A child is killed and reported if it exceeds {CHILD_TIMEOUT_S}s rather than hanging.")
     print("This is what the previous run did not isolate: it compiled four dim_batch")
     print("values in a single process. A real fit compiles exactly one.")
     print(f"Each configuration runs {args.repeat}x, so within-configuration reproducibility")
@@ -334,7 +369,6 @@ def main() -> None:
                 r = run_child(tag, extra, quiet=True)
                 if r:
                     meta[(db, compiled, rep)] = r
-                    print(f"  {tag:>14}: identity_distance={r['identity_distance']:.6f}")
 
     results["configs"] = {f"db{db}-{'c' if c else 'nc'}-r{r_}": v
                           for (db, c, r_), v in meta.items()}
