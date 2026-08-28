@@ -27,6 +27,17 @@ inherit the first's answer -- and Qwen3.5's answer is ``false`` only because tha
 checkpoint has no BOS token at all. Same for ``dim_batch``, whose memory scaling
 depends on ``n_layers`` and ``d_model``.
 
+``gate_identity`` guards against a silently corrupt fit
+-------------------------------------------------------
+
+``torch.compile`` miscompiles Qwen3.5 in 30-50% of processes, per process rather than
+per prompt, and the lens it saves has the right shape, dtype and size and the wrong
+numbers. A fit therefore checks its **first prompt's** ``identity_distance`` against
+``gate_identity`` and aborts if it is out of band -- one prompt, because the failure is
+per-process. The reference is measured uncompiled, the only configuration that has never
+failed, and is per model, per corpus and per box, which is exactly the shape of a
+per-model profile entry.
+
 ``dim_batch`` is the optimum, not the ceiling
 ---------------------------------------------
 
@@ -111,6 +122,13 @@ class ModelFacts:
     #: s_per_prompt comes from FitProgress.elapsed_s, which is taken before
     #: write_checkpoint(), so checkpoint I/O is not in it.
     s_per_prompt_excludes: str = "checkpoint I/O"
+    #: Reference prompt-1 identity_distance for the fit gate, measured uncompiled.
+    #: Per model, per corpus and per box, so it belongs here rather than as a constant:
+    #: torch.compile miscompiles this model in 30-50% of processes and the resulting
+    #: lens looks valid, so a fit checks its first prompt against this and aborts.
+    #: See f-2026-08-28-compile-miscompilation.
+    gate_identity: float | None = None
+    gate_identity_basis: str = "uncompiled single prompt"
     notes: str = ""
 
 

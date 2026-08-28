@@ -143,21 +143,21 @@ def run_fit(dim_batch: int, fresh: bool) -> dict:
     for p in existing:
         p.unlink()
 
-    cmd = [
-        sys.executable, str(FIT_LENS), MODEL_ID,
-        "--out_dir", str(out_dir),
-        "--n_prompts", str(N_PROMPTS),
-        "--dim_batch", str(dim_batch),
-        "--max_seq_len", str(MAX_SEQ_LEN),
-        "--dtype", DTYPE,
-        "--device_map", DEVICE_MAP,
-        "--save_dtype", SAVE_DTYPE,
-        "--dataset", DATASET,
-        "--dataset_config", DATASET_CONFIG,
-        "--dataset_split", DATASET_SPLIT,
-        "--text_field", TEXT_FIELD,
-        "--max_chars", str(MAX_CHARS),
-    ]
+    from jlens_extensions.fitcmd import UNGATED, build_fit_command
+    from jlens_extensions.profile import MachineProfile
+
+    facts = MachineProfile.load(cfg.profile_path).model(MODEL_ID)
+    gate = facts.gate_identity if facts.gate_identity is not None else UNGATED
+    if gate is UNGATED:
+        print("  WARNING: no gate_identity in the profile; this fit is ungated and a "
+              "compiled run has a 30-50% chance of saving a corrupt lens", flush=True)
+    cmd = build_fit_command(
+        fit_lens_path=FIT_LENS, model_id=MODEL_ID, out_dir=out_dir,
+        n_prompts=N_PROMPTS, dim_batch=dim_batch, max_seq_len=MAX_SEQ_LEN,
+        dtype=DTYPE, device_map=DEVICE_MAP, save_dtype=SAVE_DTYPE,
+        dataset=DATASET, dataset_config=DATASET_CONFIG, dataset_split=DATASET_SPLIT,
+        text_field=TEXT_FIELD, max_chars=MAX_CHARS, gate_identity=gate,
+    )
     print(f"  {' '.join(cmd)}", flush=True)
     started = time.time()
     proc = subprocess.run(cmd, cwd=str(REPO / "harness"))

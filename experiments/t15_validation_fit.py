@@ -150,31 +150,25 @@ def load_corpus() -> tuple[list[str], dict]:
     return prompts, fingerprint
 
 
-def build_command(out_dir: Path, dim_batch: int, compile_model: bool) -> list[str]:
-    """The published recipe, minus early stopping, with the profile's execution knobs.
+def build_command(out_dir: Path, dim_batch: int, compile_model: bool,
+                  gate_identity) -> list[str]:
+    """The published recipe minus early stopping, via the shared builder.
 
-    ``--hf_cache_dir`` is deliberately not passed: ``fit_lens.py`` ``rmtree``s it in a
-    ``finally`` unless ``--keep_hf_cache`` is also given, which would re-download every
-    weight on each run. ``cfg.hf_env()`` gets the same confinement without the deletion.
+    Built by ``jlens_extensions.fitcmd`` rather than assembled here, because the gate
+    against the torch.compile miscompilation has to be on every fit and a per-driver
+    argv is how it gets forgotten -- this driver and the dim_batch probe each had their
+    own and neither carried it.
     """
-    cmd = [
-        sys.executable, str(FIT_LENS), MODEL_ID,
-        "--out_dir", str(out_dir),
-        "--n_prompts", str(N_PROMPTS),
-        "--dim_batch", str(dim_batch),
-        "--max_seq_len", str(MAX_SEQ_LEN),
-        "--dtype", DTYPE,
-        "--device_map", DEVICE_MAP,
-        "--save_dtype", SAVE_DTYPE,
-        "--dataset", DATASET,
-        "--dataset_config", DATASET_CONFIG,
-        "--dataset_split", DATASET_SPLIT,
-        "--text_field", TEXT_FIELD,
-        "--max_chars", str(MAX_CHARS),
-    ]
-    if not compile_model:
-        cmd.append("--no_compile")
-    return cmd
+    from jlens_extensions.fitcmd import build_fit_command
+
+    return build_fit_command(
+        fit_lens_path=FIT_LENS, model_id=MODEL_ID, out_dir=out_dir,
+        n_prompts=N_PROMPTS, dim_batch=dim_batch, max_seq_len=MAX_SEQ_LEN,
+        dtype=DTYPE, device_map=DEVICE_MAP, save_dtype=SAVE_DTYPE,
+        dataset=DATASET, dataset_config=DATASET_CONFIG, dataset_split=DATASET_SPLIT,
+        text_field=TEXT_FIELD, max_chars=MAX_CHARS,
+        no_compile=not compile_model, gate_identity=gate_identity,
+    )
 
 
 def read_trace(csv_path: Path) -> dict:
@@ -235,12 +229,13 @@ def prepare_out_dir(out_dir: Path, label: str, resume: bool, fresh: bool) -> Non
     )
 
 
-def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool) -> dict:
+def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool,
+            gate_identity=None) -> dict:
     out_dir = cfg.scratch_root / "fits" / f"t15-{label}"
     dest = cfg.lenses / f"t15-{label}"
     prepare_out_dir(out_dir, label, resume, fresh)
 
-    cmd = build_command(out_dir, facts.dim_batch, facts.compile)
+    cmd = build_command(out_dir, facts.dim_batch, facts.compile, gate_identity)
     print(f"\n=== run {label} ===")
     print("  " + " ".join(cmd), flush=True)
     projected_h = facts.s_per_prompt * N_PROMPTS / 3600.0
@@ -280,6 +275,7 @@ def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool) -> di
             "max_seq_len": MAX_SEQ_LEN, "dtype": DTYPE, "device_map": DEVICE_MAP,
             "compile": facts.compile, "save_dtype": SAVE_DTYPE,
             "target_layer": None, "early_stopping": False,
+            "gate_identity": gate_identity, "compile_blocks": "auto",
             "stop_at_delta": None, "checkpoint_every": 1, "resumed": resume,
         },
         profile_path=cfg.profile_path,
@@ -316,6 +312,26 @@ def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool) -> di
             "wall_s": wall_s, **trace}
 
 
+def resolve_gate(facts):
+    """The gate reference from the profile, or a refusal that says how to get one."""
+    from jlens_extensions.fitcmd import UNGATED
+
+    if facts.gate_identity is not None:
+        print(f"gate: prompt-1 identity_distance within 1% of {facts.gate_identity:.6f} "
+              f"({facts.gate_identity_basis})")
+        return facts.gate_identity
+    if not facts.compile:
+        return UNGATED  # uncompiled has never failed; nothing to guard
+    raise SystemExit(
+        "the machine profile has no gate_identity for this model, and the fit would "
+        "run compiled.\n"
+        "torch.compile miscompiles this model in 30-50% of processes and the lens it "
+        "saves looks valid (f-2026-08-28-compile-miscompilation).\n"
+        "Measure the reference with experiments/probe_gate_identity.py, or pass "
+        "--ungated to fit without the check deliberately."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -325,6 +341,9 @@ def main() -> None:
                         help="allow an existing checkpoint to be resumed")
     parser.add_argument("--fresh", action="store_true",
                         help="delete any existing lens/checkpoint and refit")
+    parser.add_argument("--ungated", action="store_true",
+                        help="fit without the compile gate -- deliberate, and recorded "
+                             "in the sidecar")
     args = parser.parse_args()
     if args.resume and args.fresh:
         raise SystemExit("--resume and --fresh are mutually exclusive")
@@ -344,7 +363,10 @@ def main() -> None:
 
     _, corpus_fp = load_corpus()
 
-    results = [run_one(label, facts, corpus_fp, args.resume, args.fresh) for label in labels]
+    from jlens_extensions.fitcmd import UNGATED
+    gate_identity = UNGATED if args.ungated else resolve_gate(facts)
+    results = [run_one(label, facts, corpus_fp, args.resume, args.fresh, gate_identity)
+               for label in labels]
 
     print("\n--- T15 summary ---")
     header = f"{'run':>4} {'rows':>5} {'wall_h':>7} {'s/prompt':>9} {'identity_distance':>18} {'mean_rel_change':>16}"

@@ -20,6 +20,10 @@ because those are large and machine-specific.
 - **Reusable logic belongs in `src/jlens_extensions/`, not here.** If two drivers
   would share a function, it is library code. The corollary: a driver should be
   mostly corpus wrangling, a loop, and a table.
+- **Never assemble a `fit_lens.py` argv by hand.** Use
+  `jlens_extensions.fitcmd.build_fit_command`, which requires the compile gate rather
+  than defaulting it. Two drivers previously built their own and neither carried the
+  gate — which is what a defence relying on every caller remembering actually does.
 - **Never edit `harness/` to take a measurement.** The fork has to stay
   artifact-comparable. Where a measurement genuinely requires perturbing the
   harness — timing a diagnostic by removing it, say — that edit is a local
@@ -34,6 +38,7 @@ later spec's numbering cannot collide with them.
 
 | Driver | Produces |
 |---|---|
+| `probe_gate_identity.py` | The reference prompt-1 `identity_distance` for a model, measured uncompiled and written into the machine profile. Run once per model per box; `t15_validation_fit.py` refuses to run a compiled fit without it. |
 | `dim_batch_diagnosis.py` | **Diagnostic, run this before reading `dim_batch_neutrality.py`'s output.** Separates three explanations for that driver's implausible result — a batch-size-dependent forward, a `torch.compile` specialisation, or the estimator — on one prompt with no fit. |
 | `dim_batch_neutrality.py` | Whether `dim_batch` changes the fitted tensor, tested against T15's pair as a pure-noise null so the variable is isolated on one box. Reports per-layer excess over that null and whether it is depth-independent — the shape T16's unexplained residual has. |
 | `envelope_vs_n.py` | The run-to-run envelope against prompt count, at one fixed configuration (fp32, compiled, `dim_batch=8`), and a per-layer scaling exponent. Re-measures what T18 established through fp16 and at a different execution config. Gets six prompt counts out of a single 60-prompt pass by resuming the running sum. |
