@@ -93,6 +93,42 @@ whatever we do, so storing ours at fp32 keeps that comparison at the stated sing
 ~5e-4 instead of inflating it to ~7e-4, and fp32 can always be cast down where fp16
 cannot be recovered.
 
+### A sixth change: compile policy and the identity gate
+
+`--compile_blocks` and `--gate_identity` on `fit_lens.py` (2026-08-28). Also ours, not
+upstream's, and the first change here that alters default behaviour.
+
+**Why the default moved.** `torch.compile` miscompiles Qwen3.5-0.8B in **30-50% of
+processes**, silently, producing a lens with the right shape, dtype and file size and the
+wrong numbers. Measured over 72 draws, the fault is localised to the **full-attention**
+blocks: compiling only the 18 linear-attention blocks failed 0 of 20, compiling only the
+6 full-attention blocks failed 6 of 20, compiling all 24 failed 10 of 20. Full write-up
+in `f-2026-08-28-compile-miscompilation`.
+
+So `--compile_blocks` defaults to `auto`: on a hybrid model compile only the
+linear-attention blocks, on a homogeneous one compile everything. `all` restores the
+vendored behaviour. This costs nothing — the six risky blocks were contributing almost
+none of the speedup, so `auto` runs at 43.0 s/child against 42.5 for compiling everything,
+against 79.5 uncompiled.
+
+**A default that silently corrupts an artifact half the time is not a default worth
+preserving for fidelity's sake.** The numerical effect of the change where compilation
+*succeeds* is small — sound all-blocks runs give identity_distance 0.531268/0.531295 and
+sound linear-attn-only runs 0.531430/0.531469, a ~3e-4 relative difference, far inside
+every floor in `f-2026-08-27-lens-reproduction-verdict`.
+
+`--gate_identity` is off unless given. When set, the first prompt's `identity_distance`
+must be within `--gate_tol` (default 1%) or the fit aborts before writing anything. The
+failure is per-process, not per-prompt, so one check at prompt 1 covers the whole run;
+every sound value observed sits within 0.05% of the reference and every failure at least
+2.3% away, so the bands do not touch.
+
+**One structural consequence.** `harness/fit_lens.py` now imports
+`jlens_extensions.compile_policy`, so the vendored slice is no longer self-contained. The
+imports are function-local, so the file still parses and runs uncompiled and ungated
+without our package installed. `harness/jlens/` itself is untouched — the policy is
+applied after `from_hf(compile=False)` rather than by changing `hf.py`.
+
 **Deferred, with triggers.** `_check_layer_indices()` lands with the first patch that
 passes `source_layers` explicitly — expected before the 27B fit — so the guard arrives
 alongside the argument it guards. `apply(positions=…)` lands at the first

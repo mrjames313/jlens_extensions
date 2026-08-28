@@ -138,7 +138,11 @@ class ConvergenceTracker:
         stop_at_delta: float | None = None,
         min_prompts: int = 100,
         window: int = 10,
+        gate_identity: float | None = None,
+        gate_tol: float = 0.01,
     ) -> None:
+        self.gate_identity = gate_identity
+        self.gate_tol = gate_tol
         self.csv_path = csv_path
         self.thresholds = thresholds
         self.stop_at_delta = stop_at_delta
@@ -163,6 +167,17 @@ class ConvergenceTracker:
         )
 
     def record(self, p: jlens.FitProgress) -> bool:
+        # The gate, at the first prompt. torch.compile miscompiles this model in a
+        # third to a half of processes, per-process rather than per-prompt, and the
+        # lens it then saves looks entirely valid. Checking here costs one prompt;
+        # not checking costs an hour and leaves a corrupt artifact on disk.
+        if self.gate_identity is not None and p.n_done == 1:
+            from jlens_extensions.compile_policy import check_identity_gate
+
+            check_identity_gate(
+                p.identity_distance, self.gate_identity, tol=self.gate_tol,
+                n_done=p.n_done, context="Aborting the fit before it writes a lens.",
+            )
         self._writer.writerow(
             [
                 p.n_done,
@@ -237,6 +252,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--text_module", default=None, help="dotted path to the text decoder (auto-detected)"
     )
     parser.add_argument("--no_compile", action="store_true", help="disable per-layer torch.compile")
+    parser.add_argument(
+        "--compile_blocks",
+        default="auto",
+        choices=("auto", "all", "linear-attn", "full-attn", "none"),
+        help=(
+            "which residual blocks to compile. 'auto' (default) compiles only the "
+            "linear-attention blocks on a hybrid model and everything on a homogeneous "
+            "one. On Qwen3.5 compiling the full-attention blocks miscompiles in 30-50%% "
+            "of processes while contributing almost none of the speedup -- see "
+            "f-2026-08-28-compile-miscompilation. 'all' is the vendored behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--gate_identity",
+        type=float,
+        default=None,
+        help=(
+            "expected identity_distance at prompt 1. If given, a run outside "
+            "--gate_tol of it aborts immediately instead of spending an hour "
+            "producing a corrupt lens. The miscompilation is per-process, so one "
+            "check at prompt 1 covers the whole fit."
+        ),
+    )
+    parser.add_argument("--gate_tol", type=float, default=0.01,
+                        help="relative tolerance for --gate_identity (default 0.01)")
     parser.add_argument(
         "--device_map",
         default="cuda",
@@ -375,7 +415,20 @@ def main() -> None:
         tok = transformers.AutoTokenizer.from_pretrained(
             args.model, cache_dir=hub_cache, trust_remote_code=args.trust_remote_code
         )
-        model = jlens.from_hf(hf, tok, text_module=args.text_module, compile=not args.no_compile)
+        # from_hf(compile=True) compiles every block. We apply the policy ourselves so
+        # the vendored library stays as Neuronpedia wrote it.
+        model = jlens.from_hf(hf, tok, text_module=args.text_module, compile=False)
+        compile_info = None
+        if not args.no_compile:
+            from jlens_extensions.compile_policy import apply_compile_policy
+
+            compile_info = apply_compile_policy(model, args.compile_blocks)
+            print(
+                f"Compiled {compile_info['n_compiled']}/{compile_info['n_blocks']} blocks "
+                f"(policy={args.compile_blocks}"
+                + (", hybrid model" if compile_info["hybrid"] else "")
+                + ")"
+            )
         print(f"Wrapped: {model!r}")
 
         print(
@@ -401,7 +454,12 @@ def main() -> None:
             stop_at_delta=args.stop_at_delta,
             min_prompts=args.min_prompts,
             window=args.stop_window,
+            gate_identity=args.gate_identity,
+            gate_tol=args.gate_tol,
         )
+        if args.gate_identity is not None:
+            print(f"Gate: prompt-1 identity_distance must be within "
+                  f"{args.gate_tol:.1%} of {args.gate_identity:.6f}")
         print(f"Fitting lens over {len(prompts)} prompts (first call compiles, ~1-2 min) ...")
         try:
             lens = jlens.fit(
