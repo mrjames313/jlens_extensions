@@ -107,6 +107,8 @@ Run::
 
     uv run python experiments/dim_batch_diagnosis.py
     uv run python experiments/dim_batch_diagnosis.py --dim-batches 8,16,32,64
+    uv run python experiments/dim_batch_diagnosis.py --soak 10 --dim-batches 16
+    uv run python experiments/dim_batch_diagnosis.py --soak 10 --compile-layers full-attn
 """
 
 from __future__ import annotations
@@ -131,6 +133,9 @@ os.environ.update(cfg.hf_env())
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
 D_MODEL = 1024
+DEFAULT_DIM_BATCHES = "8,16,32,64"
+#: T15's setting, and the cell with the highest observed failure rate.
+SOAK_DEFAULT_DIM_BATCH = 8
 
 #: Prompt-1 identity_distance for this model on this corpus, from runs independently
 #: corroborated against Neuronpedia's published lens. Compiled sound runs give
@@ -459,7 +464,9 @@ def soak(dim_batch: int, reps: int, scratch: Path, which: str = "all") -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dim-batches", default="8,16,32,64")
+    parser.add_argument("--dim-batches", default=None,
+                        help="comma-separated dim_batch values (default 8,16,32,64). "
+                             "With --soak, pass exactly one.")
     parser.add_argument("--skip-forward", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the saved Jacobians")
     parser.add_argument("--repeat", type=int, default=2,
@@ -467,8 +474,6 @@ def main() -> None:
     parser.add_argument("--soak", type=int, metavar="REPS",
                         help="skip the matrix; repeat ONE dim_batch on both call paths "
                              "REPS times and count failures")
-    parser.add_argument("--soak-dim-batch", type=int, default=8,
-                        help="which dim_batch to soak (default 8, T15's setting)")
     parser.add_argument("--compile-layers", default="all",
                         choices=("all", "full-attn", "linear-attn", "none"),
                         help="which residual blocks to compile; localises the fault "
@@ -478,7 +483,25 @@ def main() -> None:
     parser.add_argument("--compiled", action="store_true")
     parser.add_argument("--out")
     args = parser.parse_args()
-    batches = [int(x) for x in args.dim_batches.split(",") if x.strip()]
+    raw = args.dim_batches
+    batches = [int(x) for x in (raw or DEFAULT_DIM_BATCHES).split(",") if x.strip()]
+
+    # --soak takes ONE dim_batch. It used to read a separate --soak-dim-batch, so
+    # passing --dim-batches 16 --soak N silently soaked 8 instead. Two flags whose
+    # names differ by a plural, and the natural one did nothing -- so there is now
+    # one flag, and an explicit list of the wrong length is an error rather than a
+    # value quietly discarded.
+    soak_db = None
+    if args.soak:
+        if raw is None:
+            soak_db = SOAK_DEFAULT_DIM_BATCH
+        elif len(batches) != 1:
+            raise SystemExit(
+                f"--soak runs one configuration many times, so it needs exactly one "
+                f"--dim-batches value; got {batches}. Pass e.g. --dim-batches 16."
+            )
+        else:
+            soak_db = batches[0]
 
     if args.child:
         child(args)
@@ -487,18 +510,20 @@ def main() -> None:
     scratch_early = cfg.scratch_root / "diag-jacobians"
     if args.soak:
         print(f"machine={cfg.machine}  model={MODEL_ID}")
-        print(f"Soak: compiled dim_batch={args.soak_dim_batch} ({args.compile_layers} blocks),")
+        origin = "default" if raw is None else "from --dim-batches"
+        print(f"Soak: compiled dim_batch={soak_db} ({origin}), "
+              f"{args.compile_layers} blocks compiled,")
         print(f"{args.soak} draws per path,")
         print(f"each in its own process. ~{2 * args.soak * 45 // 60} minutes.")
-        res = soak(args.soak_dim_batch, args.soak, scratch_early, args.compile_layers)
+        res = soak(soak_db, args.soak, scratch_early, args.compile_layers)
         out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"soak_db{args.soak_dim_batch}.json").write_text(
+        (out / f"soak_db{soak_db}.json").write_text(
             json.dumps({"task": "compile-soak", "machine": cfg.machine,
-                        "dim_batch": args.soak_dim_batch, "reps": args.soak,
+                        "dim_batch": soak_db, "reps": args.soak,
                         "expected_identity": EXPECTED_IDENTITY,
                         "summary": res}, indent=2, default=str) + "\n")
-        print(f"\nwrote {out / f'soak_db{args.soak_dim_batch}.json'}")
+        print(f"\nwrote {out / f'soak_db{soak_db}.json'}")
         return
 
     print(f"machine={cfg.machine}  model={MODEL_ID}  dim_batches={batches}")
@@ -512,7 +537,8 @@ def main() -> None:
 
     if not args.skip_forward:
         results["forward"] = run_child("forward", ["--child", "forward",
-                                                   "--dim-batches", args.dim_batches])
+                                                   "--dim-batches",
+                                                   ",".join(str(b) for b in batches)])
 
     n_children = 2 * len(batches) * args.repeat
     print(f"\n=== computing Jacobians, ONE configuration per process ===")
