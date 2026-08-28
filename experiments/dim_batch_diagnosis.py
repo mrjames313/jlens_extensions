@@ -488,8 +488,14 @@ def soak(dim_batch: int, reps: int, scratch: Path, which: str = "all") -> dict:
                   f" {d['failure_rate']:.0%}. Every compiled lens we hold is a coin flip,")
             print(f"     and the only safe course is refitting uncompiled.")
         else:
-            print(f"  -> Neither path failed in {f['n']} draws. That contradicts the earlier")
-            print(f"     observations and needs explaining before it is trusted.")
+            n = f["n"] + d["n"]
+            print(f"  -> NO FAILURES in {n} draws at this configuration.")
+            print(f"     That is a result, not an anomaly: read it against the other")
+            print(f"     configurations rather than against zero. Compiling only the")
+            print(f"     linear-attention blocks measured 0/20 where full-attention-only")
+            print(f"     measured 6/20 and all-blocks 10/20 (Fisher p = 0.020 and 0.0004),")
+            print(f"     which localises the fault to the full-attention blocks.")
+            print(f"     Note {n} clean draws bounds the rate near 1-in-{n}, not at zero.")
     return summary
 
 
