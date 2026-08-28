@@ -146,7 +146,20 @@ def rel(a, b) -> float:
     return (a - b).norm().item() / n if n else float("nan")
 
 
-def build(compile_model: bool):
+def build(compile_model: bool, which: str = "all"):
+    """Build the lens model, optionally compiling only some residual blocks.
+
+    ``from_hf`` compiles per block -- ``self.layers[i] = torch.compile(...)`` -- so
+    the two block kinds can be compiled independently. Qwen3.5 alternates Gated
+    DeltaNet (linear attention, ``.linear_attn``) with full attention roughly 3:1,
+    and the dynamo guard that kept failing named exactly that attribute
+    (``KeyError on self._modules['linear_attn']``). Compiling one kind and not the
+    other says which is implicated.
+
+    ``which``: ``all`` (the default, what our fits do), ``full-attn`` (compile only
+    blocks *without* ``.linear_attn``), ``linear-attn`` (only those *with* it), or
+    ``none``.
+    """
     import torch
     import transformers
 
@@ -156,7 +169,18 @@ def build(compile_model: bool):
         MODEL_ID, torch_dtype=torch.bfloat16
     ).cuda()
     tok = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
-    return jlens.from_hf(hf, tok, compile=compile_model)
+    model = jlens.from_hf(hf, tok, compile=(compile_model and which == "all"))
+
+    if compile_model and which in ("full-attn", "linear-attn"):
+        wanted_linear = which == "linear-attn"
+        n = 0
+        for i, block in enumerate(model.layers):
+            is_linear = hasattr(block, "linear_attn")
+            if is_linear == wanted_linear:
+                model.layers[i] = torch.compile(block, mode="default", dynamic=False)
+                n += 1
+        print(f"    compiled {n}/{len(model.layers)} blocks ({which})", flush=True)
+    return model
 
 
 def one_prompt() -> str:
@@ -219,7 +243,8 @@ def check_a_forward(model, prompt: str, batches: list[int]) -> dict:
             "worst": verdict}
 
 
-def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path) -> dict:
+def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path,
+                     which: str = "all") -> dict:
     """One prompt's Jacobian at one configuration, in this process, saved to disk.
 
     Saved rather than returned because each configuration runs in its own process --
@@ -229,7 +254,7 @@ def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path) -> dic
 
     from jlens.fitting import jacobian_for_prompt
 
-    model = build(compile_model)
+    model = build(compile_model, which)
     prompt = one_prompt()
     source_layers = list(range(model.n_layers - 1))
     J, seq_len, n_valid = jacobian_for_prompt(
@@ -254,7 +279,8 @@ def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path) -> dic
             "path": str(out_path), "dynamo": recompiles}
 
 
-def compute_via_fit(dim_batch: int, compile_model: bool, out_path: Path) -> dict:
+def compute_via_fit(dim_batch: int, compile_model: bool, out_path: Path,
+                    which: str = "all") -> dict:
     """The same single-prompt Jacobian, but reached through ``fit()``.
 
     This is the discriminator. ``jacobian_for_prompt`` called directly and called by
@@ -272,7 +298,7 @@ def compute_via_fit(dim_batch: int, compile_model: bool, out_path: Path) -> dict
 
     from jlens.fitting import fit
 
-    model = build(compile_model)
+    model = build(compile_model, which)
     prompt = one_prompt()
     lens = fit(
         model, [prompt],
@@ -298,9 +324,11 @@ def child(args) -> None:
         payload = check_a_forward(build(compile_model=False), one_prompt(),
                                   [int(x) for x in args.dim_batches.split(",")])
     elif args.child == "jacobian":
-        payload = compute_jacobian(args.dim_batch, args.compiled, Path(args.out))
+        payload = compute_jacobian(args.dim_batch, args.compiled, Path(args.out),
+                                   args.compile_layers)
     elif args.child == "via_fit":
-        payload = compute_via_fit(args.dim_batch, args.compiled, Path(args.out))
+        payload = compute_via_fit(args.dim_batch, args.compiled, Path(args.out),
+                                  args.compile_layers)
     else:
         raise SystemExit(f"unknown check {args.child!r}")
     print(RESULT_PREFIX + json.dumps(payload, default=str), flush=True)
@@ -369,7 +397,7 @@ def classify(ident: float) -> str:
     return "subtle" if off < 0.5 else "catastrophic"
 
 
-def soak(dim_batch: int, reps: int, scratch: Path) -> dict:
+def soak(dim_batch: int, reps: int, scratch: Path, which: str = "all") -> dict:
     """Repeat ONE configuration many times on both call paths, and count failures.
 
     The question this settles. At compiled ``dim_batch=8`` the direct call has failed
@@ -388,7 +416,8 @@ def soak(dim_batch: int, reps: int, scratch: Path) -> dict:
             tag = f"soak-db{dim_batch}-{path_name}-r{rep}"
             dest = scratch / f"{tag}.pt"
             r = run_child(tag, ["--child", child_mode, "--dim-batch", str(dim_batch),
-                                "--compiled", "--out", str(dest)], quiet=True)
+                                "--compiled", "--compile-layers", which,
+                                "--out", str(dest)], quiet=True)
             if r:
                 out[path_name].append(r["identity_distance"])
             dest.unlink(missing_ok=True)
@@ -440,6 +469,10 @@ def main() -> None:
                              "REPS times and count failures")
     parser.add_argument("--soak-dim-batch", type=int, default=8,
                         help="which dim_batch to soak (default 8, T15's setting)")
+    parser.add_argument("--compile-layers", default="all",
+                        choices=("all", "full-attn", "linear-attn", "none"),
+                        help="which residual blocks to compile; localises the fault "
+                             "to a block kind (default all, what our fits do)")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compiled", action="store_true")
@@ -454,9 +487,10 @@ def main() -> None:
     scratch_early = cfg.scratch_root / "diag-jacobians"
     if args.soak:
         print(f"machine={cfg.machine}  model={MODEL_ID}")
-        print(f"Soak: compiled dim_batch={args.soak_dim_batch}, {args.soak} draws per path,")
+        print(f"Soak: compiled dim_batch={args.soak_dim_batch} ({args.compile_layers} blocks),")
+        print(f"{args.soak} draws per path,")
         print(f"each in its own process. ~{2 * args.soak * 45 // 60} minutes.")
-        res = soak(args.soak_dim_batch, args.soak, scratch_early)
+        res = soak(args.soak_dim_batch, args.soak, scratch_early, args.compile_layers)
         out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
         out.mkdir(parents=True, exist_ok=True)
         (out / f"soak_db{args.soak_dim_batch}.json").write_text(
