@@ -27,6 +27,7 @@ from typing import Any, Sequence
 
 __all__ = [
     "POLICIES",
+    "ensure_cuda_context",
     "DEFAULT_POLICY",
     "IDENTITY_TOL",
     "CompileGateError",
@@ -142,3 +143,45 @@ def check_identity_gate(
         f"usually enough. If it repeats, fit with --compile_blocks none.\n"
         f"Refusing to continue -- the lens this run would save looks valid and is not."
     )
+
+
+def ensure_cuda_context() -> dict[str, Any]:
+    """Initialise the CUDA context and the autograd worker threads before real work.
+
+    Every run of this fitting path emits, on its first backward::
+
+        UserWarning: Attempting to run cuBLAS, but there was no current CUDA context!
+        Attempting to set the primary context...
+        (from Variable._execution_engine.run_backward)
+
+    The autograd engine runs backwards on **worker threads**. Moving the model to the
+    GPU establishes the primary context on the *main* thread, so the first backward on a
+    fresh worker finds none current on its own thread and cuBLAS attaches one lazily. It
+    succeeds, and the value it produces is correct -- the uncompiled probe returns
+    0.531523, matching three prior runs to six decimal places.
+
+    So this is not a fix for a known bug. It is a **hypothesis worth testing**: lazy
+    context attachment on a worker thread is per-process state that varies between
+    otherwise identical runs, which is the shape of the miscompilation in
+    ``f-2026-08-28-compile-miscompilation``. Inductor-generated kernels may be less
+    tolerant of it than eager cuBLAS, which would fit uncompiled never failing while
+    compiled fails 30-50% of the time.
+
+    It does not obviously explain the block-kind localisation, so treat it as a lead
+    rather than an explanation. ``dim_batch_diagnosis.py --warmup-context`` measures
+    whether it changes the failure rate; until that says otherwise, the gate is what
+    protects a fit.
+
+    The warm-up runs a matmul **and its backward**, because a forward alone initialises
+    cuBLAS on the main thread and leaves the worker threads -- the ones that emit the
+    warning -- untouched.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return {"warmed": False, "reason": "no CUDA device"}
+    torch.cuda.init()
+    a = torch.zeros(8, 8, device="cuda", requires_grad=True)
+    (a @ a).sum().backward()
+    torch.cuda.synchronize()
+    return {"warmed": True, "device": torch.cuda.get_device_name(0)}

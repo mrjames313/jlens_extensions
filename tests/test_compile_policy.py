@@ -211,3 +211,29 @@ def test_no_gate_configured_means_no_check(tracker_cls, tmp_path):
     t = tracker_cls(str(tmp_path / "c.csv"), (1e-2,))
     assert t.record(_progress(8.410543)) is False
     t.close()
+
+
+# --- CUDA context warm-up ---------------------------------------------------
+
+
+def test_warmup_is_a_no_op_without_cuda():
+    """It must not raise on a dev box; the tests run where there is no GPU."""
+    from jlens_extensions.compile_policy import ensure_cuda_context
+
+    result = ensure_cuda_context()
+    assert "warmed" in result
+    if not result["warmed"]:
+        assert "reason" in result
+
+
+def test_warmup_runs_a_backward_not_just_a_forward():
+    """The warning comes from the autograd engine's worker threads, so a forward-only
+    warm-up would leave exactly the threads that emit it uninitialised."""
+    import inspect
+
+    from jlens_extensions.compile_policy import ensure_cuda_context
+
+    src = inspect.getsource(ensure_cuda_context)
+    assert "backward()" in src
+    assert "requires_grad=True" in src
+    assert "synchronize()" in src

@@ -134,6 +134,7 @@ os.environ.update(cfg.hf_env())
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
 D_MODEL = 1024
+WARMUP_CONTEXT = False
 DEFAULT_DIM_BATCHES = "8,16,32,64"
 #: T15's setting, and the cell with the highest observed failure rate.
 SOAK_DEFAULT_DIM_BATCH = 8
@@ -150,6 +151,15 @@ IDENTITY_TOL = 0.01
 def rel(a, b) -> float:
     n = b.norm().item()
     return (a - b).norm().item() / n if n else float("nan")
+
+
+def maybe_warm_context(enabled: bool) -> None:
+    if not enabled:
+        return
+    from jlens_extensions.compile_policy import ensure_cuda_context
+
+    info = ensure_cuda_context()
+    print(f"    warmed CUDA context and autograd workers: {info}", flush=True)
 
 
 def build(compile_model: bool, which: str = "all"):
@@ -260,6 +270,7 @@ def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path,
 
     from jlens.fitting import jacobian_for_prompt
 
+    maybe_warm_context(WARMUP_CONTEXT)
     model = build(compile_model, which)
     prompt = one_prompt()
     source_layers = list(range(model.n_layers - 1))
@@ -304,6 +315,7 @@ def compute_via_fit(dim_batch: int, compile_model: bool, out_path: Path,
 
     from jlens.fitting import fit
 
+    maybe_warm_context(WARMUP_CONTEXT)
     model = build(compile_model, which)
     prompt = one_prompt()
     lens = fit(
@@ -452,9 +464,11 @@ def soak(dim_batch: int, reps: int, scratch: Path, which: str = "all") -> dict:
         for rep in range(reps):
             tag = f"soak-db{dim_batch}-{path_name}-r{rep}"
             dest = scratch / f"{tag}.pt"
-            r = run_child(tag, ["--child", child_mode, "--dim-batch", str(dim_batch),
-                                "--compiled", "--compile-layers", which,
-                                "--out", str(dest)], quiet=True)
+            extra = ["--child", child_mode, "--dim-batch", str(dim_batch),
+                     "--compiled", "--compile-layers", which, "--out", str(dest)]
+            if WARMUP_CONTEXT:
+                extra.append("--warmup-context")
+            r = run_child(tag, extra, quiet=True)
             if r:
                 out[path_name].append(r["identity_distance"])
             dest.unlink(missing_ok=True)
@@ -516,6 +530,10 @@ def main() -> None:
                         choices=("all", "full-attn", "linear-attn", "none"),
                         help="which residual blocks to compile; localises the fault "
                              "to a block kind (default all, what our fits do)")
+    parser.add_argument("--warmup-context", action="store_true",
+                        help="initialise the CUDA context and autograd workers before "
+                             "building the model, then measure whether the failure rate "
+                             "changes (a lead, not a known fix)")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compiled", action="store_true")
@@ -541,6 +559,8 @@ def main() -> None:
         else:
             soak_db = batches[0]
 
+    global WARMUP_CONTEXT
+    WARMUP_CONTEXT = args.warmup_context
     if args.child:
         child(args)
         return
