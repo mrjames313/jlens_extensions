@@ -90,6 +90,12 @@ from jlens_extensions.compile_policy import cluster_variants, identity_in_band  
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
 D_MODEL = 1024
+#: Prompt 0's sound identity_distance on this model. Used only as a fallback and
+#: as a sanity check -- the gate reference is MEASURED per prompt, see
+#: reference_identity(). Different prompts have different Jacobians and therefore
+#: different identity_distance: prompt 1 sits at ~0.5644, 6.2% from this value, so
+#: gating prompt 1 against this constant rejects every sound draw including the
+#: uncompiled ones. That is exactly what the first run of the 18-arm grid did.
 EXPECTED_IDENTITY = 0.5314
 IDENTITY_TOL = 0.01
 
@@ -185,6 +191,27 @@ def child_draw(dim_batch: int, which: str, out_path: Path,
     return {"dim_batch": dim_batch, "compile_layers": which, "compiled": compiled,
             "prompt_idx": prompt_idx, "identity_distance": ident, "seq_len": seq_len,
             "n_valid": n_valid, "path": str(out_path)}
+
+
+def reference_identity(prompt_idx: int, scratch: Path) -> float:
+    """One uncompiled draw, to establish what a sound run looks like on THIS prompt.
+
+    `f-2026-08-28-compile-miscompilation` already prescribes this for a model with no
+    reference value: compute prompt 1 uncompiled first and gate the compiled runs
+    against it. The prompt is the same kind of axis -- a different prompt is a
+    different Jacobian and a different identity_distance -- so the reference is
+    measured per prompt rather than carried from prompt 0.
+
+    Uncompiled cannot miscompile, so this draw needs no gate of its own.
+    """
+    dest = scratch / f"gate-ref-p{prompt_idx}.pt"
+    r = run_child(__file__, f"gate-reference-p{prompt_idx}",
+                  ["--child", "draw", "--dim-batch", "8", "--compile-layers", "none",
+                   "--prompt-index", str(prompt_idx), "--out", str(dest)])
+    dest.unlink(missing_ok=True)
+    if not r:
+        raise SystemExit(f"could not establish a gate reference for prompt {prompt_idx}")
+    return r["identity_distance"]
 
 
 # ------------------------------------------------------------------------- analysis
@@ -286,6 +313,11 @@ def analyse(draws: list[dict]) -> dict:
             for l, vals in bucket.items():
                 null[l].extend(vals)
 
+    per_group = {}
+    for (ga, gb), bucket in pairs.items():
+        if ga == gb and bucket:
+            per_group[group_label(ga)] = {l: rms(v) for l, v in bucket.items()}
+
     matrix = {}
     for (ga, gb), bucket in pairs.items():
         if ga == gb:
@@ -297,13 +329,81 @@ def analyse(draws: list[dict]) -> dict:
             "n_pairs": len(next(iter(bucket.values()), [])), "layers": rows,
         }
     return {"noise_rms": {l: rms(null[l]) for l in layers},
+            "noise_per_group": per_group,
             "groups": [group_label(g) for g in groups], "pairs": matrix}
+
+
+def assign_variants(draws: list[dict]) -> None:
+    """Cluster each arm's sound readings into compile variants, in place.
+
+    Variants are per (configuration, dim_batch, prompt): the sound values differ
+    between arms, so clustering across arms would split on the arm instead.
+    """
+    for d in draws:
+        d["arm"] = (d["compile_layers"], d["dim_batch"], d["prompt_idx"])
+    for arm in sorted({d["arm"] for d in draws}):
+        members = [d for d in draws if d["arm"] == arm]
+        clusters = cluster_variants([d["identity_distance"] for d in members])
+        for vi, cluster in enumerate(clusters):
+            for i in cluster:
+                members[i]["variant"] = vi
+        vals = ", ".join(f"v{i}: {members[c[0]]['identity_distance']:.6f} x{len(c)}"
+                         for i, c in enumerate(clusters))
+        print(f"  {arm[0]}:{arm[1]}@p{arm[2]} -> {len(clusters)} variant(s)  [{vals}]")
+
+
+def reanalyse(manifest: Path) -> None:
+    """Redo the analysis from a finished run's saved Jacobians.
+
+    The reason tensors are kept. The analysis has been rebuilt twice now while the
+    draws underneath it stayed valid, and each rebuild would otherwise have cost a
+    fresh grid -- hours -- instead of the couple of minutes this takes.
+    """
+    payload = json.loads(manifest.read_text())
+    draws = [d for d in payload["draws"] if Path(d["path"]).exists()]
+    missing = len(payload["draws"]) - len(draws)
+    print(f"re-analysing {manifest}")
+    print(f"{len(draws)} draws with tensors on disk"
+          + (f", {missing} whose tensors are gone" if missing else ""))
+    if not draws:
+        raise SystemExit("no saved tensors to re-analyse; the run must keep them")
+    load_tensors(draws)
+    assign_variants(draws)
+    results = analyse(draws)
+    report(results)
+    dest = manifest.with_name(manifest.stem + "_reanalysed.json")
+    dest.write_text(json.dumps(
+        {"task": "offset-profile-reanalysis", "source": str(manifest),
+         "n_draws": len(draws), "groups": results["groups"],
+         "noise_rms": results["noise_rms"],
+         "noise_per_group": results["noise_per_group"],
+         "results": results["pairs"]}, indent=2, default=str) + "\n")
+    print(f"\nwrote {dest}")
 
 
 def report(result: dict, layers_shown=(0, 4, 8, 15, 22)) -> None:
     noise = result["noise_rms"]
     print("\n=== run-to-run noise (same path, different process), per layer ===")
     print("   " + "  ".join(f"L{l}: {noise[l]:.3e}" for l in layers_shown if l in noise))
+
+    # Per group, sorted by the worst top-of-stack value. Genuine bf16 noise falls
+    # ~4 orders of magnitude from L0 to L22; a group whose L22 sits near its L0 is
+    # not noisy, it holds draws that are not the same computation. Pooling hides
+    # that -- the 18-arm grid pooled a contaminated null into a figure 1300x too
+    # large at L22 with nothing on screen saying so.
+    pg = result.get("noise_per_group") or {}
+    if pg:
+        top = max(l for l in layers_shown if any(l in v for v in pg.values()))
+        print("\n=== that noise per group -- a flat depth profile means contamination ===")
+        hdr = f"{'group':>26} {'L0':>11} {'L' + str(top):>11} {'falloff':>10}  flag"
+        print(hdr); print("-" * len(hdr))
+        for label, prof in sorted(pg.items(), key=lambda kv: -(kv[1].get(top) or 0)):
+            lo, hi = prof.get(0), prof.get(top)
+            if lo is None or hi is None or hi <= 0:
+                continue
+            fall = lo / hi
+            print(f"{label:>26} {lo:>11.3e} {hi:>11.3e} {fall:>9.0f}x"
+                  + ("" if fall > 100 else "  <-- SUSPECT"))
 
     kinds = ["variant", "dim_batch", "compile config", "multiple"]
     print("\n=== offsets between execution paths, grouped by what differs ===")
@@ -352,12 +452,19 @@ def main() -> None:
                              "the analysis has already been rebuilt once, and "
                              "re-analysing costs minutes where re-running the grid "
                              "costs hours")
+    parser.add_argument("--analyse", metavar="MANIFEST",
+                        help="skip all draws and redo the analysis from a previous "
+                             "run's saved Jacobians (its offset_profile.json)")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compile-layers")
     parser.add_argument("--prompt-index", type=int, default=0)
     parser.add_argument("--out")
     args = parser.parse_args()
+
+    if args.analyse:
+        reanalyse(Path(args.analyse))
+        return
 
     if args.child:
         emit_result(child_draw(args.dim_batch, args.compile_layers, Path(args.out),
@@ -383,7 +490,16 @@ def main() -> None:
     print(f"Estimated {est_min:.0f} minutes of draws, then a few minutes of analysis.")
     print(f"Analysis holds every draw in memory: ~{total_draws * 96 / 1024:.1f} GB.\n")
 
+    # One uncompiled probe per prompt, before any gated draw on that prompt.
+    references: dict[int, float] = {}
+    for q in prompts:
+        references[q] = reference_identity(q, scratch)
+        off = abs(references[q] - EXPECTED_IDENTITY) / EXPECTED_IDENTITY
+        note = "" if q == 0 else f"   ({off:.1%} from prompt 0 -- as expected, different prompt)"
+        print(f"  gate reference, prompt {q}: {references[q]:.6f}{note}", flush=True)
+
     draws: list[dict] = []
+    rejected: list[dict] = []
     dropped = 0
     # Written after every draw. An unattended run that dies partway then leaves both
     # the manifest and the tensors on disk, so the completed arms stay analysable
@@ -402,35 +518,29 @@ def main() -> None:
             # Gate before the draw enters any group. A miscompiled Jacobian is not a
             # variant and not a datum -- averaging one in would contaminate every
             # comparison it appears in.
-            if not identity_in_band(r["identity_distance"], EXPECTED_IDENTITY, IDENTITY_TOL):
+            if not identity_in_band(r["identity_distance"], references[prompt_idx],
+                                    IDENTITY_TOL):
                 print(f"     {tag} MISCOMPILED (identity={r['identity_distance']:.6f})"
                       f" -- dropped", flush=True)
-                dest.unlink(missing_ok=True)
+                # Keep the tensor. A "drop" is a gate verdict, and the gate has
+                # already been wrong once: the first 18-arm grid gated prompt 1
+                # against prompt 0's reference and discarded 50 sound draws,
+                # uncompiled ones included, deleting the evidence as it went.
+                r["dropped"] = True
+                rejected.append(r)
                 dropped += 1
                 continue
             draws.append(r)
             progress.write_text(json.dumps(
                 {"complete": False, "n_sound": len(draws), "n_dropped": dropped,
-                 "arms": [list(a) for a in arms], "draws": draws}, indent=2,
+                 "arms": [list(a) for a in arms], "draws": draws,
+                 "rejected": rejected}, indent=2,
                 default=str) + "\n")
 
-    print(f"\n{len(draws)} sound draws, {dropped} dropped as miscompiled.")
+    print(f"\n{len(draws)} sound draws, {dropped} dropped as miscompiled "
+          f"(their tensors are kept too -- a drop is a gate verdict, not a fact).")
     load_tensors(draws)
-
-    # Variants are per (configuration, dim_batch): the sound values differ between
-    # configurations, so clustering across arms would split on configuration instead.
-    for d in draws:
-        d["arm"] = (d["compile_layers"], d["dim_batch"], d["prompt_idx"])
-    for arm in {d["arm"] for d in draws}:
-        members = [d for d in draws if d["arm"] == arm]
-        clusters = cluster_variants([d["identity_distance"] for d in members])
-        for vi, cluster in enumerate(clusters):
-            for i in cluster:
-                members[i]["variant"] = vi
-        vals = ", ".join(f"v{i}: {members[c[0]]['identity_distance']:.6f} x{len(c)}"
-                         for i, c in enumerate(clusters))
-        print(f"  {arm[0]}:{arm[1]}@p{arm[2]} -> {len(clusters)} variant(s)  [{vals}]")
-
+    assign_variants(draws)
     results = analyse(draws)
     report(results)
 
@@ -439,6 +549,8 @@ def main() -> None:
         {"task": "offset-profile", "machine": cfg.machine, "model": MODEL_ID,
          "arms": [list(a) for a in arms],
          "n_sound": len(draws), "n_dropped": dropped,
+         "rejected": [{k: v for k, v in d.items() if k != "tensors"}
+                      for d in rejected],
          "groups": results["groups"], "noise_rms": results["noise_rms"],
          "draws": [{k: v for k, v in d.items() if k not in ("arm", "tensors")}
                    for d in draws],
