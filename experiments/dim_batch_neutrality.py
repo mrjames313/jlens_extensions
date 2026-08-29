@@ -9,7 +9,8 @@ Follow-on from T16. Not a spec task.
    result, it is a symptom: T16 found our ``dim_batch=8`` lens matching a ``dim_batch=128``
    reference to 1.4e-3, and both cannot be true. The harness's own ``identity_distance``
    differs from the **first prompt** (0.531268 at 8, 0.543 at 64), so it reproduces
-   without a fit. Run ``dim_batch_diagnosis.py`` first; until that resolves, treat this
+   without a fit. (That 0.531268 is a different ``dim_batch=8`` run, not T15's -- both
+   T15 fits read 0.531295, the other sound all-blocks compile variant.) Run ``dim_batch_diagnosis.py`` first; until that resolves, treat this
    driver's verdict as uninterpretable rather than as evidence about `dim_batch`.
 
 The question

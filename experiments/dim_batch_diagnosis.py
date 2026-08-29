@@ -70,6 +70,12 @@ code of ours:
 * ``identity_distance`` on the **first prompt** is 0.531268 at ``dim_batch=8`` and 0.543
   at 64. One prompt, one Jacobian -- so this is inside ``jacobian_for_prompt``, not in
   accumulation, and needs no 233-prompt fit to reproduce.
+
+  Provenance note, added 2026-08-29: the 0.531268 here is **not** T15's value. Both T15
+  runs read 0.531295 at prompt 1 -- the other of the two sound all-blocks compile variants
+  (`f-2026-08-28-compile-miscompilation`). Both are sound and the argument above is
+  unaffected, but do not use 0.531268 as T15's variant label: it would say the pair split
+  when it did not.
 * The whole convergence trajectory differs (Δmean < 0.01 at 45 prompts against 68).
 
 What this separates
