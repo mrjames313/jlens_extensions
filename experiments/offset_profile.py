@@ -99,8 +99,9 @@ IDENTITY_TOL = 0.01
 DEFAULT_ARMS = (("all", 8), ("linear-attn", 8), ("none", 8), ("linear-attn", 64))
 
 
-def parse_arms(spec: str | None, default_draws: int) -> list[tuple[str, int, int]]:
-    """``policy:dim_batch[:draws]``, comma-separated. Returns (policy, dim_batch, draws).
+def parse_arms(spec: str | None,
+               default_draws: int) -> list[tuple[str, int, int, int]]:
+    """``policy:dim_batch[:draws[:prompt]]``. Returns (policy, dim_batch, draws, prompt).
 
     Draws are per-arm because the arms do not need the same number, and giving them
     the same number spends the budget in the wrong places. Two effects set the
@@ -116,9 +117,16 @@ def parse_arms(spec: str | None, default_draws: int) -> list[tuple[str, int, int
 
     `none` is uncompiled and therefore single-variant, so it needs draws only for its
     noise null and can be the cheapest row despite being the slowest per draw.
+
+    **The prompt field is the fourth axis and the cheapest insurance here.** Every
+    offset this driver measures is measured *on one input*, and scaling an n=1 number
+    to n=233 assumes the per-prompt magnitude is representative rather than a lucky
+    draw. Repeating a subset of arms at a second prompt tests that directly. Jacobians
+    for different prompts are different quantities, so the prompt is part of the arm
+    and no comparison ever crosses it.
     """
     if not spec:
-        return [(p, d, default_draws) for p, d in DEFAULT_ARMS]
+        return [(p, d, default_draws, 0) for p, d in DEFAULT_ARMS]
     arms = []
     for item in spec.split(","):
         parts = [x for x in item.strip().split(":") if x != ""]
@@ -129,14 +137,16 @@ def parse_arms(spec: str | None, default_draws: int) -> list[tuple[str, int, int
             raise SystemExit(f"unknown compile policy {policy!r} in --arms")
         db = int(parts[1]) if len(parts) > 1 else 8
         draws = int(parts[2]) if len(parts) > 2 else default_draws
-        arms.append((policy, db, draws))
+        prompt = int(parts[3]) if len(parts) > 3 else 0
+        arms.append((policy, db, draws, prompt))
     return arms
 
 
 # --------------------------------------------------------------------------- child
 
 
-def child_draw(dim_batch: int, which: str, out_path: Path) -> dict:
+def child_draw(dim_batch: int, which: str, out_path: Path,
+               prompt_idx: int = 0) -> dict:
     """One prompt's Jacobian at one configuration, in this process, saved to disk."""
     import torch
     import transformers
@@ -158,9 +168,11 @@ def child_draw(dim_batch: int, which: str, out_path: Path) -> dict:
             if hasattr(block, "linear_attn") == wanted_linear:
                 model.layers[i] = torch.compile(block, mode="default", dynamic=False)
 
+    # The corpus is a deterministic prefix, so asking for idx+1 and taking the last
+    # selects prompt idx reproducibly -- the same prompt every process, every run.
     prompt = load_prompts(dataset="Salesforce/wikitext", config="wikitext-103-raw-v1",
-                          split="train", text_field="text", n_prompts=1,
-                          max_chars=2000)[0]
+                          split="train", text_field="text", n_prompts=prompt_idx + 1,
+                          max_chars=2000)[-1]
     source_layers = list(range(model.n_layers - 1))
     J, seq_len, n_valid = jacobian_for_prompt(
         model, prompt, source_layers, target_layer=None,
@@ -171,8 +183,8 @@ def child_draw(dim_batch: int, which: str, out_path: Path) -> dict:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({l: J[l].float() for l in source_layers}, str(out_path))
     return {"dim_batch": dim_batch, "compile_layers": which, "compiled": compiled,
-            "identity_distance": ident, "seq_len": seq_len, "n_valid": n_valid,
-            "path": str(out_path)}
+            "prompt_idx": prompt_idx, "identity_distance": ident, "seq_len": seq_len,
+            "n_valid": n_valid, "path": str(out_path)}
 
 
 # ------------------------------------------------------------------------- analysis
@@ -290,11 +302,13 @@ def main() -> None:
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compile-layers")
+    parser.add_argument("--prompt-index", type=int, default=0)
     parser.add_argument("--out")
     args = parser.parse_args()
 
     if args.child:
-        emit_result(child_draw(args.dim_batch, args.compile_layers, Path(args.out)))
+        emit_result(child_draw(args.dim_batch, args.compile_layers, Path(args.out),
+                               args.prompt_index))
         return
 
     arms = parse_arms(args.arms, args.draws)
@@ -305,11 +319,14 @@ def main() -> None:
     #: uncompiled rate, and the estimate is what tells an unattended run whether it
     #: fits the budget before it starts rather than after.
     COST_S = {"all": 47, "linear-attn": 47, "full-attn": 60, "none": 72}
-    total_draws = sum(n for _, _, n in arms)
-    est_min = sum(n * COST_S.get(p, 55) for p, _, n in arms) / 60
+    total_draws = sum(n for _, _, n, _ in arms)
+    est_min = sum(n * COST_S.get(p, 55) for p, _, n, _ in arms) / 60
+    prompts = sorted({q for _, _, _, q in arms})
     print(f"machine={cfg.machine}  model={MODEL_ID}")
     print(f"{len(arms)} arms, {total_draws} draws, each in its own process.")
-    print(f"Arms: {', '.join(f'{p}:{d}x{n}' for p, d, n in arms)}")
+    print(f"Prompts: {prompts}"
+          + ("  (comparisons never cross a prompt)" if len(prompts) > 1 else ""))
+    print(f"Arms: {', '.join(f'{p}:{d}x{n}@p{q}' for p, d, n, q in arms)}")
     print(f"Estimated {est_min:.0f} minutes of draws, then a few minutes of analysis.")
     print(f"Analysis holds every draw in memory: ~{total_draws * 96 / 1024:.1f} GB.\n")
 
@@ -319,13 +336,14 @@ def main() -> None:
     # the manifest and the tensors on disk, so the completed arms stay analysable
     # instead of costing the whole sitting.
     progress = out / "offset_profile_progress.json"
-    for policy, db, n_draws in arms:
+    for policy, db, n_draws, prompt_idx in arms:
         for rep in range(n_draws):
-            tag = f"{policy}-db{db}-r{rep}"
+            tag = f"{policy}-db{db}-p{prompt_idx}-r{rep}"
             dest = scratch / f"{tag}.pt"
-            r = run_child(__file__, tag, ["--child", "draw", "--dim-batch", str(db),
-                                          "--compile-layers", policy, "--out", str(dest)],
-                          quiet=True)
+            r = run_child(__file__, tag,
+                          ["--child", "draw", "--dim-batch", str(db),
+                           "--compile-layers", policy, "--prompt-index", str(prompt_idx),
+                           "--out", str(dest)], quiet=True)
             if not r:
                 continue
             # Gate before the draw enters any group. A miscompiled Jacobian is not a
@@ -349,7 +367,7 @@ def main() -> None:
     # Variants are per (configuration, dim_batch): the sound values differ between
     # configurations, so clustering across arms would split on configuration instead.
     for d in draws:
-        d["arm"] = (d["compile_layers"], d["dim_batch"])
+        d["arm"] = (d["compile_layers"], d["dim_batch"], d["prompt_idx"])
     for arm in {d["arm"] for d in draws}:
         members = [d for d in draws if d["arm"] == arm]
         clusters = cluster_variants([d["identity_distance"] for d in members])
@@ -358,7 +376,7 @@ def main() -> None:
                 members[i]["variant"] = vi
         vals = ", ".join(f"v{i}: {members[c[0]]['identity_distance']:.6f} x{len(c)}"
                          for i, c in enumerate(clusters))
-        print(f"  {arm[0]}:{arm[1]} -> {len(clusters)} variant(s)  [{vals}]")
+        print(f"  {arm[0]}:{arm[1]}@p{arm[2]} -> {len(clusters)} variant(s)  [{vals}]")
 
     results = {}
     null = noise_pairs(draws)
@@ -369,9 +387,10 @@ def main() -> None:
     for arm in sorted({d["arm"] for d in draws}):
         members = [d for d in draws if d["arm"] == arm]
         if len({d["variant"] for d in members}) < 2:
-            print(f"\n  {arm[0]}:{arm[1]}: one variant only -- no variant comparison")
+            print(f"\n  {arm[0]}:{arm[1]}@p{arm[2]}: one variant only"
+                  f" -- no variant comparison")
             continue
-        name = f"variant offset, {arm[0]}:{arm[1]}"
+        name = f"variant offset, {arm[0]}:{arm[1]} @prompt{arm[2]}"
         results[name] = decompose(members, lambda d: d["variant"], name)
         variant_term[arm] = {l: (r.get("offset") or 0.0)
                              for l, r in results[name]["layers"].items()}
@@ -387,22 +406,23 @@ def main() -> None:
         return {l: max(t.get(l, 0.0) for t in terms) for l in terms[0]}
 
     # 2. configurations, at fixed dim_batch
-    for db in sorted({d["dim_batch"] for d in draws}):
-        members = [d for d in draws if d["dim_batch"] == db]
+    for db, q in sorted({(d["dim_batch"], d["prompt_idx"]) for d in draws}):
+        members = [d for d in draws if d["dim_batch"] == db and d["prompt_idx"] == q]
         if len({d["compile_layers"] for d in members}) < 2:
             continue
-        name = f"configuration offset, dim_batch={db}"
+        name = f"configuration offset, dim_batch={db} @prompt{q}"
         results[name] = decompose(members, lambda d: d["compile_layers"], name,
                                   null=null,
                                   subtract=worst_variant_term({d["arm"] for d in members}))
         report(name, results[name])
 
     # 3. dim_batch, at fixed configuration
-    for policy in sorted({d["compile_layers"] for d in draws}):
-        members = [d for d in draws if d["compile_layers"] == policy]
+    for policy, q in sorted({(d["compile_layers"], d["prompt_idx"]) for d in draws}):
+        members = [d for d in draws
+                   if d["compile_layers"] == policy and d["prompt_idx"] == q]
         if len({d["dim_batch"] for d in members}) < 2:
             continue
-        name = f"dim_batch offset, {policy}"
+        name = f"dim_batch offset, {policy} @prompt{q}"
         results[name] = decompose(members, lambda d: d["dim_batch"], name,
                                   null=null,
                                   subtract=worst_variant_term({d["arm"] for d in members}))
