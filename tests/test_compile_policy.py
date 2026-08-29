@@ -18,6 +18,7 @@ from jlens_extensions.compile_policy import (
     CompileGateError,
     check_identity_gate,
     classify_blocks,
+    cluster_variants,
     identity_in_band,
     select_block_indices,
 )
@@ -237,3 +238,39 @@ def test_warmup_runs_a_backward_not_just_a_forward():
     assert "backward()" in src
     assert "requires_grad=True" in src
     assert "synchronize()" in src
+
+
+# --- cluster_variants -------------------------------------------------------
+
+
+def test_cluster_variants_splits_the_two_sound_all_block_values():
+    # The real readings: 0.531268 and 0.531295, 5.1e-5 apart relative, each repeated.
+    vals = [0.531295, 0.531268, 0.531268, 0.531295, 0.531268]
+    clusters = cluster_variants(vals)
+    assert len(clusters) == 2
+    assert sorted(len(c) for c in clusters) == [2, 3]
+    # ordered by the cluster's smallest value
+    assert all(vals[i] == 0.531268 for i in clusters[0])
+    assert all(vals[i] == 0.531295 for i in clusters[1])
+
+
+def test_cluster_variants_splits_the_linear_attn_pair_too():
+    clusters = cluster_variants([0.531430, 0.531469, 0.531430])
+    assert len(clusters) == 2
+
+
+def test_cluster_variants_keeps_one_variant_together():
+    # Uncompiled repeats agree to six decimals; sixth-decimal jitter is not a variant.
+    clusters = cluster_variants([0.531523, 0.531523, 0.531524])
+    assert len(clusters) == 1
+
+
+def test_cluster_variants_default_gap_has_margin_on_both_sides():
+    """The threshold must sit between within-variant jitter and variant separation."""
+    within = 1e-6 / 0.5314          # six-decimal jitter, relative
+    between = 2.7e-5 / 0.531268     # the tighter of the two real separations
+    assert within * 4 < 1e-5 < between / 4
+
+
+def test_cluster_variants_empty():
+    assert cluster_variants([]) == []

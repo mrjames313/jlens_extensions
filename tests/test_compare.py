@@ -24,6 +24,7 @@ from jlens_extensions.compare import (  # noqa: E402
     fp16_roundtrip,
     fit_power_law,
     fp16_storage_floor,
+    group_offset,
     identity_distance,
     identity_fraction,
     layer_correspondence,
@@ -408,3 +409,61 @@ def test_fit_power_law_needs_two_positive_points():
 def test_fit_power_law_rejects_a_degenerate_x_range():
     with pytest.raises(ValueError, match="one prompt count"):
         fit_power_law([(20, 1e-3), (20, 2e-3)])
+
+
+# --- group_offset -----------------------------------------------------------
+
+
+def test_group_offset_subtracts_the_noise_in_quadrature():
+    """within = sqrt(2)|d|, between = sqrt(|D|^2 + 2|d|^2)  ->  offset = |D|."""
+    within = [1.0, 1.0, 1.0]
+    between = [5.0**0.5, 5.0**0.5]      # |D| = 2 on top of the same noise
+    r = group_offset(within, between)
+    assert r["resolved"] is True
+    assert r["offset"] == pytest.approx(2.0)
+    assert r["within_rms"] == pytest.approx(1.0)
+
+
+def test_group_offset_reading_the_difference_directly_would_overstate_it():
+    """The point of the subtraction: the raw between-group rms is not the offset."""
+    r = group_offset([1.0], [5.0**0.5])
+    assert r["between_rms"] > r["offset"]          # 2.236 read naively vs 2.0 true
+    assert r["between_rms"] / r["offset"] == pytest.approx(5.0**0.5 / 2.0)
+
+
+def test_group_offset_unresolved_returns_a_bound_not_a_zero_offset():
+    # An offset far under the noise: between is indistinguishable from within.
+    r = group_offset([1.0, 1.1], [0.9, 1.0])
+    assert r["resolved"] is False
+    assert r["offset"] == 0.0
+    assert r["bound"] == pytest.approx(((1.0**2 + 1.1**2) / 2) ** 0.5)
+
+
+def test_group_offset_does_not_resolve_on_a_marginal_excess():
+    """Under a true null, between exceeds within about half the time.
+
+    The criterion is ||Delta|| > within_rms, not between > within, so a small
+    sampling excess must NOT be reported as a resolved offset.
+    """
+    r = group_offset([1.0, 1.0], [1.02, 1.02])
+    assert r["between_rms"] > r["within_rms"]     # the naive test would fire
+    assert r["resolved"] is False
+    assert r["offset"] < r["bound"]
+
+
+def test_group_offset_unresolved_bound_is_a_real_exclusion():
+    """Failing the criterion implies between^2 <= 2 within^2, so |Delta| <= within."""
+    r = group_offset([1.0, 1.0], [1.3, 1.3])
+    assert r["resolved"] is False
+    assert r["offset"] <= r["bound"]
+
+
+def test_group_offset_needs_both_sides():
+    r = group_offset([1.0], [])
+    assert r["offset"] is None
+    assert r["resolved"] is False
+
+
+def test_group_offset_counts_pairs():
+    r = group_offset([1.0, 1.0], [2.0, 2.0, 2.0])
+    assert (r["n_within"], r["n_between"]) == (2, 3)

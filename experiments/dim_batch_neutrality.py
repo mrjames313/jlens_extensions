@@ -10,7 +10,12 @@ Follow-on from T16. Not a spec task.
    reference to 1.4e-3, and both cannot be true. The harness's own ``identity_distance``
    differs from the **first prompt** (0.531268 at 8, 0.543 at 64), so it reproduces
    without a fit. (That 0.531268 is a different ``dim_batch=8`` run, not T15's -- both
-   T15 fits read 0.531295, the other sound all-blocks compile variant.) Run ``dim_batch_diagnosis.py`` first; until that resolves, treat this
+   T15 fits read 0.531295, the other sound all-blocks compile variant.)
+
+   **Superseded 2026-08-29 by** ``offset_profile.py``, which asks this question
+   gated, at the safe compile configuration, and against a measured within-group
+   noise null rather than against T15's pair alone. Prefer it. This driver is kept
+   for its argument, not for its answer -- it never had one. Run ``dim_batch_diagnosis.py`` first; until that resolves, treat this
    driver's verdict as uninterpretable rather than as evidence about `dim_batch`.
 
 The question

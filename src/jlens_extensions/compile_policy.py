@@ -118,6 +118,52 @@ def identity_in_band(value: float, expected: float, tol: float = IDENTITY_TOL) -
     return abs(value - expected) / abs(expected) <= tol
 
 
+def cluster_variants(values: Sequence[float], *,
+                     rel_gap: float = 1e-5) -> list[list[int]]:
+    """Group sound ``identity_distance`` readings into compile variants.
+
+    A compiled process draws one of a small number of numerically distinct but
+    equally sound compilations. On Qwen3.5-0.8B at torch 2.13.0 there are two
+    whenever the linear-attention blocks are compiled -- 0.531268/0.531295 with all
+    blocks, 0.531430/0.531469 with linear-attention only -- and one otherwise
+    (`f-2026-08-28-compile-miscompilation`). Which variant a fit drew is a property
+    of the *process*, and two fits that drew different ones differ by a systematic
+    term that no run-to-run envelope describes.
+
+    Returns a list of clusters, each a list of indices into ``values``, ordered by
+    the cluster's smallest value. Splits wherever consecutive sorted values are more
+    than ``rel_gap`` apart in relative terms.
+
+    **Discovered, not tabulated.** A per-model table of known variant values would
+    need updating for every new model and torch build, and would fail silently when
+    out of date -- the argument that made
+    ``d-2026-08-25-probe-norm-gain`` probe the module instead of reading a
+    convention. The variants are far better separated from each other than the
+    within-variant spread (which is zero to six decimals on repeats), so clustering
+    on a gap recovers them from the data alone.
+
+    The default ``rel_gap`` sits between the two scales it has to tell apart, with
+    about 5x margin on each side: repeats *within* a variant agree to six decimals
+    (~2e-6 relative), while the variants are 5.1e-5 apart with all blocks compiled
+    and 7.3e-5 with linear-attention only. A threshold at the variant separation
+    itself would have had 1.6% margin and split on noise.
+
+    Pass only sound values. A miscompiled reading is not a variant and will form its
+    own spurious cluster; filter with :func:`identity_in_band` first.
+    """
+    if not values:
+        return []
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    clusters: list[list[int]] = [[order[0]]]
+    for prev, idx in zip(order, order[1:]):
+        span = abs(values[idx] - values[prev]) / max(abs(values[prev]), 1e-30)
+        if span > rel_gap:
+            clusters.append([idx])
+        else:
+            clusters[-1].append(idx)
+    return clusters
+
+
 def check_identity_gate(
     value: float,
     expected: float,

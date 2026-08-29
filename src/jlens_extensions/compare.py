@@ -142,6 +142,58 @@ def rel_frobenius(a, b) -> float:
     return (a - b).norm().item() / denom
 
 
+def group_offset(within: Sequence[float], between: Sequence[float]) -> dict[str, Any]:
+    """Separate a systematic between-group offset from the noise both groups carry.
+
+    Two independent draws differ by their two independent noise draws, so a
+    same-group pair reads ``sqrt(2)*||delta||``. A cross-group pair carries that plus
+    any systematic offset ``Delta`` between the groups, and since the two are
+    independent they add in quadrature::
+
+        within^2  = 2||delta||^2
+        between^2 = ||Delta||^2 + 2||delta||^2   ->   ||Delta|| = sqrt(between^2 - within^2)
+
+    That subtraction is the whole point. A cross-group difference read directly
+    *overstates* the offset by whatever noise the pair happened to draw, and at one
+    prompt the noise is ~13x its 233-prompt amplitude
+    (`f-2026-08-27-envelope-scaling`, alpha = 0.473), so reading it directly is not a
+    small error.
+
+    **When is the offset actually resolved?** Not merely when ``between`` exceeds
+    ``within`` -- both are finite-sample estimates, so under a true null that happens
+    about half the time and would report a spurious offset on a coin flip. The
+    criterion here is ``||Delta|| > within_rms``, i.e. the systematic term must be at
+    least as large as the noise term it was extracted from. It is deliberately
+    conservative, and it has a clean converse: failing it means
+    ``between^2 <= 2*within^2``, hence ``||Delta|| <= within_rms``, so ``bound`` is a
+    real exclusion rather than a shrug.
+
+    ``bound`` is reported either way as the measurement's resolution floor, and
+    ``offset`` is always the point estimate -- read it with ``resolved``, and treat an
+    unresolved value as "somewhere below ``bound``" rather than as a number.
+
+    Both outcomes are informative: an offset below a criterion's floor makes a
+    same-variant qualifier precautionary, one comparable to it makes the qualifier
+    load-bearing. Resolving an offset that sits well under the noise needs more
+    draws, not more prompts -- the offset is systematic and does not average down.
+    """
+    if not within or not between:
+        return {"offset": None, "resolved": False, "reason": "need both pair sets",
+                "n_within": len(within), "n_between": len(between)}
+    w = (sum(v * v for v in within) / len(within)) ** 0.5
+    b = (sum(v * v for v in between) / len(between)) ** 0.5
+    offset = (b * b - w * w) ** 0.5 if b > w else 0.0
+    return {
+        "offset": offset,
+        "resolved": offset > w,
+        "bound": w,
+        "within_rms": w,
+        "between_rms": b,
+        "n_within": len(within),
+        "n_between": len(between),
+    }
+
+
 def compare_lenses(
     a: Mapping[int, Any],
     b: Mapping[int, Any],

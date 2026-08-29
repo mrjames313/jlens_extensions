@@ -122,8 +122,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -394,9 +392,6 @@ def compute_via_fit(dim_batch: int, compile_model: bool, out_path: Path,
             "path": str(out_path)}
 
 
-RESULT_PREFIX = "@@DIAG_RESULT@@ "
-
-
 def child(args) -> None:
     if args.child == "forward":
         payload = check_a_forward(build(compile_model=False), one_prompt(),
@@ -409,86 +404,19 @@ def child(args) -> None:
                                   args.compile_layers)
     else:
         raise SystemExit(f"unknown check {args.child!r}")
-    print(RESULT_PREFIX + json.dumps(payload, default=str), flush=True)
+    emit_result(payload)
 
 
-#: Per-child ceiling. Measured children take 42-95s, so this is generous by ~4x.
-#: It was 900s, which is worse than useless: nothing legitimate runs that long, and
-#: the longer the ceiling the longer a hang looks like work.
-CHILD_TIMEOUT_S = 300
+from jlens_extensions.childproc import (  # noqa: E402 - after the sys.path setup above
+    DEFAULT_TIMEOUT_S as CHILD_TIMEOUT_S,
+    emit_result,
+    run_child as _run_child,
+)
 
 
 def run_child(label: str, extra: list[str], quiet: bool = False) -> dict | None:
-    """Run one child to completion, announcing it first.
-
-    ``capture_output=True`` means nothing the child prints is visible until it exits,
-    so without the announcement below a two-minute compile looks like a hang. The
-    announcement is flushed explicitly because this output is usually piped to a log,
-    where Python block-buffers and an unflushed line would not appear either.
-    """
-    cmd = [sys.executable, str(Path(__file__).resolve()), *extra]
-    # A COMPLETE line, not a trailing "label ... " stub. A pager or a log reads by
-    # line and holds a newline-less fragment until a newline arrives, so the
-    # in-progress announcement was invisible through `| more` -- which made a run
-    # that was merely slow look frozen. Two lines per child is a small price for
-    # progress that survives being piped.
-    print(f"  -> {label} starting", flush=True)
-    started = time.time()
-
-    # start_new_session puts the child in its own process GROUP so a timeout can kill
-    # its descendants too. torch inductor spawns compile-worker subprocesses, and
-    # killing only the direct child orphans them -- they keep a GPU context and burn
-    # memory for the rest of the run.
-    #
-    # Note this is orphan hygiene, NOT a hang fix. subprocess.run(timeout=...) was
-    # suspected of deadlocking in its post-kill drain; a reproduction with a
-    # grandchild deliberately holding the pipe showed it returns promptly, because on
-    # POSIX it calls process.wait() rather than communicate(). The theory was wrong
-    # and the test is what said so.
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
-    try:
-        stdout, stderr = proc.communicate(timeout=CHILD_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        print(f"TIMED OUT after {CHILD_TIMEOUT_S}s -- killing the process group",
-              flush=True)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError) as exc:
-            print(f"     could not kill the group: {exc}", flush=True)
-        try:
-            stdout, stderr = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = "", ""
-            print("     drain still blocked after the group kill; giving up on it",
-                  flush=True)
-        print("     the other configurations still run; this one is recorded as missing.",
-              flush=True)
-        return None
-    elapsed = time.time() - started
-
-    payload = None
-    for line in stdout.splitlines():
-        if line.startswith(RESULT_PREFIX):
-            payload = json.loads(line[len(RESULT_PREFIX):])
-        elif line.strip() and not quiet:
-            print(line, flush=True)
-
-    if payload is None:
-        print(f"     {label} NO RESULT after {elapsed:.0f}s (exit {proc.returncode})",
-              flush=True)
-        for t in (stderr or "<no stderr>").strip().splitlines()[-4:]:
-            print(f"     {t}", flush=True)
-    else:
-        note = ""
-        if "recompile_limit" in (stderr or ""):
-            note = "  !! dynamo hit its recompile limit -- output suspect"
-            payload["dynamo_limit_hit"] = True
-        ident = payload.get("identity_distance")
-        detail = f"identity_distance={ident:.6f}  " if ident is not None else ""
-        print(f"     {label} done: {detail}({elapsed:.0f}s){note}", flush=True)
-    return payload
+    """Spawn this driver's own ``--child`` mode. See ``jlens_extensions.childproc``."""
+    return _run_child(__file__, label, extra, timeout_s=CHILD_TIMEOUT_S, quiet=quiet)
 
 
 def rel_tensors(pa: str, pb: str) -> dict[int, float]:
