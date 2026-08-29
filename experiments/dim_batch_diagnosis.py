@@ -141,6 +141,7 @@ MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
 D_MODEL = 1024
 WARMUP_CONTEXT = False
+DONATED_BUFFER = True
 DEFAULT_DIM_BATCHES = "8,16,32,64"
 #: T15's setting, and the cell with the highest observed failure rate.
 SOAK_DEFAULT_DIM_BATCH = 8
@@ -166,6 +167,57 @@ def maybe_warm_context(enabled: bool) -> None:
 
     info = ensure_cuda_context()
     print(f"    warmed CUDA context and autograd workers: {info}", flush=True)
+
+
+def maybe_disable_donated_buffer(enabled: bool) -> None:
+    """Optionally turn off AOTAutograd's donated-buffer optimisation before compiling.
+
+    A lead, on the same footing ``maybe_warm_context`` had before it was tested and
+    closed -- and a better-founded one, because it is a documented incompatibility
+    with the exact pattern our estimator uses rather than a warning that happens to
+    co-occur.
+
+    Donated buffers let the compiled backward free intermediate activations as it
+    consumes them. That is sound when the backward runs once. ``jacobian_for_prompt``
+    runs it ``d_model/dim_batch`` times -- 128 at ``dim_batch=8`` -- with the graph
+    retained, seeding a different cotangent each time. Upstream states the two are
+    incompatible: a backward compiled with non-empty donated buffers requires
+    ``create_graph=False`` and ``retain_graph=False``, and the documented escape is
+    exactly this flag (locuslab/torchdeq#11, pytorch/pytorch#139669, which notes the
+    combination can go silently wrong rather than raising).
+
+    Why it fits what we measured, better than block-kind selection does:
+
+    * **Compile-only.** Donation is an AOTAutograd optimisation; eager has no such
+      path. Uncompiled runs are not merely passing here, they are deterministic to
+      six decimals, which a codegen story does not explain and this one does.
+    * **Silent and catastrophic.** Reading a buffer that was freed and reused returns
+      whatever now occupies it -- identity 0.83, 5.1, 7.4-9.3, not a clean offset.
+    * **Per-process.** Whether the memory is overwritten before the next backward
+      reads it depends on allocator and scheduling state, which varies per process
+      and is stable within one. Our bad fit was wrong from its first row to its last.
+    * **Block-kind localisation.** Which buffers are donatable depends on a block's
+      activation structure, and full attention's intermediates look nothing like
+      Gated DeltaNet's recurrent state. This would give the localisation in
+      ``f-2026-08-28-compile-miscompilation`` a mechanism, which it currently lacks.
+
+    **The objection, which this experiment exists to settle.** The incompatibility is
+    supposed to *raise*. We have never seen that error, so either this path bypasses
+    the guard or our graph donates nothing and the hypothesis is simply wrong. One
+    soak at ``--donated-buffer off`` against the 10/20 all-blocks baseline decides it:
+    0/20 is a mechanism, ~10/20 kills the lead for half an hour of GPU time.
+    """
+    if enabled:
+        return
+    import torch._functorch.config as fx_config
+
+    before = getattr(fx_config, "donated_buffer", None)
+    if before is None:
+        print("    donated_buffer: NOT PRESENT in this torch build -- flag is a no-op,"
+              " and this run does NOT test the hypothesis", flush=True)
+        return
+    fx_config.donated_buffer = False
+    print(f"    donated_buffer: {before} -> {fx_config.donated_buffer}", flush=True)
 
 
 def build(compile_model: bool, which: str = "all"):
@@ -276,6 +328,7 @@ def compute_jacobian(dim_batch: int, compile_model: bool, out_path: Path,
 
     from jlens.fitting import jacobian_for_prompt
 
+    maybe_disable_donated_buffer(DONATED_BUFFER)
     maybe_warm_context(WARMUP_CONTEXT)
     model = build(compile_model, which)
     prompt = one_prompt()
@@ -321,6 +374,7 @@ def compute_via_fit(dim_batch: int, compile_model: bool, out_path: Path,
 
     from jlens.fitting import fit
 
+    maybe_disable_donated_buffer(DONATED_BUFFER)
     maybe_warm_context(WARMUP_CONTEXT)
     model = build(compile_model, which)
     prompt = one_prompt()
@@ -474,6 +528,8 @@ def soak(dim_batch: int, reps: int, scratch: Path, which: str = "all") -> dict:
                      "--compiled", "--compile-layers", which, "--out", str(dest)]
             if WARMUP_CONTEXT:
                 extra.append("--warmup-context")
+            if not DONATED_BUFFER:
+                extra.extend(["--donated-buffer", "off"])
             r = run_child(tag, extra, quiet=True)
             if r:
                 out[path_name].append(r["identity_distance"])
@@ -540,6 +596,12 @@ def main() -> None:
                         help="initialise the CUDA context and autograd workers before "
                              "building the model, then measure whether the failure rate "
                              "changes (a lead, not a known fix)")
+    parser.add_argument("--donated-buffer", default="on", choices=("on", "off"),
+                        help="'off' disables AOTAutograd's donated-buffer "
+                             "optimisation, which upstream documents as incompatible "
+                             "with the retained-graph repeated backward this estimator "
+                             "runs; compare the failure rate against the baseline for "
+                             "the same --compile-layers (a lead, not a known fix)")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compiled", action="store_true")
@@ -565,8 +627,9 @@ def main() -> None:
         else:
             soak_db = batches[0]
 
-    global WARMUP_CONTEXT
+    global WARMUP_CONTEXT, DONATED_BUFFER
     WARMUP_CONTEXT = args.warmup_context
+    DONATED_BUFFER = args.donated_buffer == "on"
     if args.child:
         child(args)
         return
@@ -577,17 +640,25 @@ def main() -> None:
         origin = "default" if raw is None else "from --dim-batches"
         print(f"Soak: compiled dim_batch={soak_db} ({origin}), "
               f"{args.compile_layers} blocks compiled,")
-        print(f"{args.soak} draws per path,")
+        print(f"donated_buffer={args.donated_buffer}, "
+              f"{args.soak} draws per path,")
         print(f"each in its own process. ~{2 * args.soak * 45 // 60} minutes.")
         res = soak(soak_db, args.soak, scratch_early, args.compile_layers)
         out = cfg.artifact_root / "measurements" / "dim-batch-diagnosis"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"soak_db{soak_db}.json").write_text(
+        # Name the file after the configuration, not just the dim_batch. Every soak
+        # used to write soak_db8.json, so a second configuration overwrote the first
+        # -- which matters most here, where the run is only meaningful read against
+        # the baseline it would have replaced.
+        stem = f"soak_db{soak_db}_{args.compile_layers}_donated-{args.donated_buffer}"
+        (out / f"{stem}.json").write_text(
             json.dumps({"task": "compile-soak", "machine": cfg.machine,
                         "dim_batch": soak_db, "reps": args.soak,
+                        "compile_layers": args.compile_layers,
+                        "donated_buffer": args.donated_buffer == "on",
                         "expected_identity": EXPECTED_IDENTITY,
                         "summary": res}, indent=2, default=str) + "\n")
-        print(f"\nwrote {out / f'soak_db{soak_db}.json'}")
+        print(f"\nwrote {out / f'{stem}.json'}")
         return
 
     print(f"machine={cfg.machine}  model={MODEL_ID}  dim_batches={batches}")
