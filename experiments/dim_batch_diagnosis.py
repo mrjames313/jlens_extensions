@@ -561,8 +561,15 @@ def soak(dim_batch: int, reps: int, scratch: Path, which: str = "all") -> dict:
             print(f"     1-in-{f['n']}, not at zero. Keep the prompt-1 gate on every fit.")
         elif f["failure_rate"] > 0:
             print(f"  -> BOTH PATHS FAIL. fit() at {f['failure_rate']:.0%}, direct at"
-                  f" {d['failure_rate']:.0%}. Every compiled lens we hold is a coin flip,")
-            print(f"     and the only safe course is refitting uncompiled.")
+                  f" {d['failure_rate']:.0%}, in this configuration.")
+            print(f"     Read that against the other arms, not against zero. This message")
+            print(f"     used to say the only safe course was refitting uncompiled; that")
+            print(f"     predates the localisation. Compiling only the linear-attention")
+            print(f"     blocks measured 0/20 at full speed, and the prompt-1 gate catches")
+            print(f"     every mode observed -- see f-2026-08-28-compile-miscompilation.")
+            print(f"     Note {f['n'] + d['n']} draws is thin: a 20-draw arm's 95% CI on 50%")
+            print(f"     spans 30-70%, so an intervention that looks like it halved the")
+            print(f"     rate may have done nothing. Resolving 25% vs 50% needs ~58/arm.")
         else:
             n = f["n"] + d["n"]
             print(f"  -> NO FAILURES in {n} draws at this configuration.")
