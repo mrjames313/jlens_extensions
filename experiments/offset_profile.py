@@ -184,12 +184,48 @@ def pair_rels(draws: list[dict], same: bool, key) -> dict[int, list[float]]:
     return out
 
 
-def decompose(draws: list[dict], key, label: str) -> dict:
-    """Within-group null against between-group difference, per layer."""
-    within = pair_rels(draws, True, key)
+def noise_pairs(draws: list[dict]) -> dict[int, list[float]]:
+    """The pure-noise null: pairs matching on arm *and* variant.
+
+    Everything else has to be measured against this rather than against its own
+    same-group pairs. Grouping by configuration or by ``dim_batch`` alone leaves
+    *different variants inside the same group*, so the "within" null then carries a
+    variant term and the subtraction removes signal along with noise. The first run
+    of this driver did exactly that: its configuration null at L22 read 4.685e-4
+    against a true noise floor of 7.4e-7, a factor of 600, and every row came back
+    "resolved" partly because the comparison was rigged against itself.
+    """
+    return pair_rels(draws, True, lambda d: (d["arm"], d["variant"]))
+
+
+def decompose(draws: list[dict], key, label: str, *,
+              null: dict[int, list[float]] | None = None,
+              subtract: dict[int, float] | None = None) -> dict:
+    """Between-group difference against a null, per layer.
+
+    ``null`` supplies the pure-noise pairs (see :func:`noise_pairs`); without it the
+    same-group pairs are used, which is only correct when the grouping key already
+    pins every other source of difference.
+
+    ``subtract`` removes a further per-layer term in quadrature -- used for the
+    cross-arm comparisons, where a pair differs by ``dim_batch`` *and* by whichever
+    variants the two processes drew. Subtracting the variant term measured in the
+    same run leaves the quantity actually being asked about.
+    """
+    within = null if null is not None else pair_rels(draws, True, key)
     between = pair_rels(draws, False, key)
     layers = sorted(set(within) | set(between))
-    rows = {l: group_offset(within.get(l, []), between.get(l, [])) for l in layers}
+    rows = {}
+    for l in layers:
+        r = group_offset(within.get(l, []), between.get(l, []))
+        if subtract and r.get("offset"):
+            extra = subtract.get(l, 0.0)
+            resid = r["offset"] ** 2 - extra * extra
+            r["offset_before_subtraction"] = r["offset"]
+            r["subtracted"] = extra
+            r["offset"] = resid ** 0.5 if resid > 0 else 0.0
+            r["resolved"] = r["offset"] > r["bound"]
+        rows[l] = r
     return {"comparison": label, "layers": rows}
 
 
@@ -285,14 +321,30 @@ def main() -> None:
         print(f"  {arm[0]}:{arm[1]} -> {len(clusters)} variant(s)  [{vals}]")
 
     results = {}
-    # 1. variants, within one arm at a time
+    null = noise_pairs(draws)
+    variant_term: dict[tuple, dict[int, float]] = {}
+
+    # 1. variants, within one arm at a time. Same arm and same variant is the only
+    #    grouping where "within" is pure noise, so this one needs no supplied null.
     for arm in sorted({d["arm"] for d in draws}):
         members = [d for d in draws if d["arm"] == arm]
         if len({d["variant"] for d in members}) < 2:
+            print(f"\n  {arm[0]}:{arm[1]}: one variant only -- no variant comparison")
             continue
         name = f"variant offset, {arm[0]}:{arm[1]}"
         results[name] = decompose(members, lambda d: d["variant"], name)
+        variant_term[arm] = {l: (r.get("offset") or 0.0)
+                             for l, r in results[name]["layers"].items()}
         report(name, results[name])
+
+    # A cross-arm pair differs by the arm AND by whichever variants it drew, so the
+    # variant term is removed too. Use the largest of the arms involved: it is the
+    # conservative choice, leaving the arm offset understated rather than inflated.
+    def worst_variant_term(arms) -> dict[int, float]:
+        terms = [variant_term[a] for a in arms if a in variant_term]
+        if not terms:
+            return {}
+        return {l: max(t.get(l, 0.0) for t in terms) for l in terms[0]}
 
     # 2. configurations, at fixed dim_batch
     for db in sorted({d["dim_batch"] for d in draws}):
@@ -300,7 +352,9 @@ def main() -> None:
         if len({d["compile_layers"] for d in members}) < 2:
             continue
         name = f"configuration offset, dim_batch={db}"
-        results[name] = decompose(members, lambda d: d["compile_layers"], name)
+        results[name] = decompose(members, lambda d: d["compile_layers"], name,
+                                  null=null,
+                                  subtract=worst_variant_term({d["arm"] for d in members}))
         report(name, results[name])
 
     # 3. dim_batch, at fixed configuration
@@ -309,7 +363,9 @@ def main() -> None:
         if len({d["dim_batch"] for d in members}) < 2:
             continue
         name = f"dim_batch offset, {policy}"
-        results[name] = decompose(members, lambda d: d["dim_batch"], name)
+        results[name] = decompose(members, lambda d: d["dim_batch"], name,
+                                  null=null,
+                                  subtract=worst_variant_term({d["arm"] for d in members}))
         report(name, results[name])
 
     out = cfg.artifact_root / "measurements" / "offset-profile"
