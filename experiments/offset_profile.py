@@ -284,6 +284,56 @@ def rms(vals) -> float:
     return (sum(v * v for v in vals) / len(vals)) ** 0.5 if vals else float("nan")
 
 
+SUSPECT_FALLOFF = 100.0
+
+
+def screen_groups(draws: list[dict], min_falloff: float = SUSPECT_FALLOFF,
+                  top_layer: int | None = None) -> list[dict]:
+    """Drop groups whose within-group spread cannot be run-to-run noise.
+
+    Genuine bf16 noise falls ~4 orders of magnitude from L0 to the top of the stack,
+    and the 121-draw grid measured that falloff at 3646-8691x across sixteen groups
+    spanning four compile configurations and four ``dim_batch`` values, with their
+    L0 floors agreeing to 17%. A group far off that profile is not a noisier version
+    of the same thing; it holds draws that are not the same computation.
+
+    Also drops single-draw groups. They contribute no within-group pairs, so nothing
+    can be said about whether they are sound, and in this grid every one of them sat
+    in a row that had contamination elsewhere.
+
+    This is a *screen*, not a gate: it runs on the assembled draws rather than on one
+    process, and it catches what the prompt-1 identity gate structurally cannot --
+    a fault that is large at early layers and invisible at L22, where
+    ``identity_distance`` is computed.
+    """
+    by_group: dict[tuple, list[dict]] = {}
+    for d in draws:
+        by_group.setdefault(group_of(d), []).append(d)
+    keep, notes = [], []
+    for g, members in sorted(by_group.items()):
+        if len(members) < 2:
+            notes.append(f"  dropped {group_label(g)}: single draw, unassessable")
+            continue
+        rels = {}
+        for a, b in itertools.combinations(members, 2):
+            for l in a["tensors"]:
+                rels.setdefault(l, []).append(rel_frobenius(a["tensors"][l],
+                                                            b["tensors"][l]))
+        top = top_layer if top_layer is not None else max(rels)
+        lo, hi = rms(rels.get(0, [])), rms(rels.get(top, []))
+        fall = lo / hi if hi > 0 else float("inf")
+        if fall < min_falloff:
+            notes.append(f"  dropped {group_label(g)}: n={len(members)}, "
+                         f"falloff {fall:.0f}x, L0 {lo:.3e} -- not noise")
+            continue
+        keep.extend(members)
+    if notes:
+        print(f"\n=== screen: {len(draws) - len(keep)} of {len(draws)} draws dropped ===")
+        for n in notes:
+            print(n)
+    return keep
+
+
 def analyse(draws: list[dict]) -> dict:
     """Pairwise offsets between every pair of groups, against a pooled noise null.
 
@@ -352,7 +402,7 @@ def assign_variants(draws: list[dict]) -> None:
         print(f"  {arm[0]}:{arm[1]}@p{arm[2]} -> {len(clusters)} variant(s)  [{vals}]")
 
 
-def reanalyse(manifest: Path) -> None:
+def reanalyse(manifest: Path, screen: bool = False) -> None:
     """Redo the analysis from a finished run's saved Jacobians.
 
     The reason tensors are kept. The analysis has been rebuilt twice now while the
@@ -369,6 +419,9 @@ def reanalyse(manifest: Path) -> None:
         raise SystemExit("no saved tensors to re-analyse; the run must keep them")
     load_tensors(draws)
     assign_variants(draws)
+    if args.screen:
+        draws = screen_groups(draws)
+        assign_variants(draws)
     results = analyse(draws)
     report(results)
     dest = manifest.with_name(manifest.stem + "_reanalysed.json")
@@ -452,6 +505,10 @@ def main() -> None:
                              "the analysis has already been rebuilt once, and "
                              "re-analysing costs minutes where re-running the grid "
                              "costs hours")
+    parser.add_argument("--screen", action="store_true",
+                        help="drop groups whose within-group spread has the wrong "
+                             "depth profile to be run-to-run noise, and single-draw "
+                             "groups; see screen_groups")
     parser.add_argument("--analyse", metavar="MANIFEST",
                         help="skip all draws and redo the analysis from a previous "
                              "run's saved Jacobians (its offset_profile.json)")
@@ -463,7 +520,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.analyse:
-        reanalyse(Path(args.analyse))
+        reanalyse(Path(args.analyse), screen=args.screen)
         return
 
     if args.child:
@@ -541,6 +598,9 @@ def main() -> None:
           f"(their tensors are kept too -- a drop is a gate verdict, not a fact).")
     load_tensors(draws)
     assign_variants(draws)
+    if args.screen:
+        draws = screen_groups(draws)
+        assign_variants(draws)
     results = analyse(draws)
     report(results)
 
