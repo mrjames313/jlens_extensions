@@ -206,85 +206,135 @@ def load_tensors(draws: list[dict]) -> None:
         d["tensors"] = torch.load(d["path"], map_location="cpu")
 
 
-def pair_rels(draws: list[dict], same: bool, key) -> dict[int, list[float]]:
-    """Per-layer relative differences over pairs that agree (or differ) on ``key``."""
-    out: dict[int, list[float]] = {}
+def group_of(d: dict) -> tuple:
+    """The unit of comparison: one execution path, on one input.
+
+    Policy, ``dim_batch``, prompt and compile variant together. Two draws in the
+    same group are two runs of the *same* computation and differ only by run-to-run
+    noise; two draws in different groups differ by whatever separates the paths.
+    """
+    return (d["compile_layers"], d["dim_batch"], d["prompt_idx"], d["variant"])
+
+
+def group_label(g: tuple) -> str:
+    return f"{g[0]}:{g[1]}@p{g[2]}/v{g[3]}"
+
+
+def classify_pair(a: tuple, b: tuple) -> str:
+    """What separates two groups. Only one thing differing is the interesting case."""
+    if a[2] != b[2]:
+        return "cross-prompt"          # never compared; different quantities
+    diffs = [a[0] != b[0], a[1] != b[1], a[3] != b[3]]
+    if sum(diffs) > 1:
+        return "multiple"
+    if diffs[0]:
+        return "compile config"
+    if diffs[1]:
+        return "dim_batch"
+    return "variant"
+
+
+def all_pair_rels(draws: list[dict]) -> dict[tuple, dict[int, list[float]]]:
+    """Every pair's per-layer relative difference, bucketed by the two groups.
+
+    One pass. Previously each comparison recomputed its own pairs, so a pair could
+    be evaluated several times; here every pair is computed once and looked up.
+    """
+    out: dict[tuple, dict[int, list[float]]] = {}
     for a, b in itertools.combinations(draws, 2):
-        if (key(a) == key(b)) != same:
+        ga, gb = group_of(a), group_of(b)
+        if ga[2] != gb[2]:             # never compare across prompts
             continue
+        key = tuple(sorted((ga, gb)))
         A, B = a["tensors"], b["tensors"]
+        bucket = out.setdefault(key, {})
         for layer in sorted(A):
-            out.setdefault(layer, []).append(rel_frobenius(A[layer], B[layer]))
+            bucket.setdefault(layer, []).append(rel_frobenius(A[layer], B[layer]))
     return out
 
 
-def noise_pairs(draws: list[dict]) -> dict[int, list[float]]:
-    """The pure-noise null: pairs matching on arm *and* variant.
+def rms(vals) -> float:
+    return (sum(v * v for v in vals) / len(vals)) ** 0.5 if vals else float("nan")
 
-    Everything else has to be measured against this rather than against its own
-    same-group pairs. Grouping by configuration or by ``dim_batch`` alone leaves
-    *different variants inside the same group*, so the "within" null then carries a
-    variant term and the subtraction removes signal along with noise. The first run
-    of this driver did exactly that: its configuration null at L22 read 4.685e-4
-    against a true noise floor of 7.4e-7, a factor of 600, and every row came back
-    "resolved" partly because the comparison was rigged against itself.
+
+def analyse(draws: list[dict]) -> dict:
+    """Pairwise offsets between every pair of groups, against a pooled noise null.
+
+    **Why a matrix and not a decomposition.** The first version of this modelled a
+    cross-arm difference as ``dim_batch offset`` plus ``variant offset`` plus noise,
+    added in quadrature, and subtracted the variant term measured in the same run.
+    The data says that model is wrong: at L0 two draws from *different* ``dim_batch``
+    values sit 1.554e-2 apart while two variants at ``dim_batch=64`` sit 1.845e-2
+    apart, so the "components" are not separable and the subtraction went negative
+    and clamped to zero across half the stack.
+
+    What the numbers look like instead is a cloud: every distinct execution path
+    lands somewhere, and the paths are all roughly the same distance from each other.
+    So the honest report is the distance between each pair of paths, with the
+    run-to-run noise removed, and a breakdown by what separates the pair -- which is
+    what says whether a ``dim_batch`` change costs more, less, or the same as drawing
+    a different compile variant.
     """
-    return pair_rels(draws, True, lambda d: (d["arm"], d["variant"]))
+    pairs = all_pair_rels(draws)
+    groups = sorted({g for k in pairs for g in k})
+    layers = sorted({l for b in pairs.values() for l in b})
 
+    # Pooled noise null: pairs whose two draws are in the same group.
+    null = {l: [] for l in layers}
+    for (ga, gb), bucket in pairs.items():
+        if ga == gb:
+            for l, vals in bucket.items():
+                null[l].extend(vals)
 
-def decompose(draws: list[dict], key, label: str, *,
-              null: dict[int, list[float]] | None = None,
-              subtract: dict[int, float] | None = None) -> dict:
-    """Between-group difference against a null, per layer.
-
-    ``null`` supplies the pure-noise pairs (see :func:`noise_pairs`); without it the
-    same-group pairs are used, which is only correct when the grouping key already
-    pins every other source of difference.
-
-    ``subtract`` removes a further per-layer term in quadrature -- used for the
-    cross-arm comparisons, where a pair differs by ``dim_batch`` *and* by whichever
-    variants the two processes drew. Subtracting the variant term measured in the
-    same run leaves the quantity actually being asked about.
-    """
-    within = null if null is not None else pair_rels(draws, True, key)
-    between = pair_rels(draws, False, key)
-    layers = sorted(set(within) | set(between))
-    rows = {}
-    for l in layers:
-        r = group_offset(within.get(l, []), between.get(l, []))
-        if subtract and r.get("offset"):
-            extra = subtract.get(l, 0.0)
-            resid = r["offset"] ** 2 - extra * extra
-            r["offset_before_subtraction"] = r["offset"]
-            r["subtracted"] = extra
-            r["offset"] = resid ** 0.5 if resid > 0 else 0.0
-            r["resolved"] = r["offset"] > r["bound"]
-        rows[l] = r
-    return {"comparison": label, "layers": rows}
-
-
-def report(name: str, result: dict) -> None:
-    rows = result["layers"]
-    if not rows or all(r.get("offset") is None for r in rows.values()):
-        print(f"\n{name}: not enough draws on both sides -- skipped")
-        return
-    print(f"\n=== {name} ===")
-    hdr = f"{'layer':>6} {'within (noise)':>15} {'between':>12} {'offset':>12}  verdict"
-    print(hdr); print("-" * len(hdr))
-    for layer in sorted(rows):
-        r = rows[layer]
-        if r.get("offset") is None:
+    matrix = {}
+    for (ga, gb), bucket in pairs.items():
+        if ga == gb:
             continue
-        if r["resolved"]:
-            verdict = "resolved"
-            off = f"{r['offset']:.3e}"
-        else:
-            # Not "no offset" -- an offset the noise floor cannot separate. The
-            # bound is a real exclusion; see compare.group_offset.
-            verdict = f"unresolved, offset < {r['bound']:.3e}"
-            off = f"({r['offset']:.3e})"
-        print(f"{layer:>6} {r['within_rms']:>15.3e} {r['between_rms']:>12.3e} "
-              f"{off:>12}  {verdict}")
+        kind = classify_pair(ga, gb)
+        rows = {l: group_offset(null.get(l, []), bucket.get(l, [])) for l in layers}
+        matrix[f"{group_label(ga)} vs {group_label(gb)}"] = {
+            "kind": kind, "a": list(ga), "b": list(gb),
+            "n_pairs": len(next(iter(bucket.values()), [])), "layers": rows,
+        }
+    return {"noise_rms": {l: rms(null[l]) for l in layers},
+            "groups": [group_label(g) for g in groups], "pairs": matrix}
+
+
+def report(result: dict, layers_shown=(0, 4, 8, 15, 22)) -> None:
+    noise = result["noise_rms"]
+    print("\n=== run-to-run noise (same path, different process), per layer ===")
+    print("   " + "  ".join(f"L{l}: {noise[l]:.3e}" for l in layers_shown if l in noise))
+
+    kinds = ["variant", "dim_batch", "compile config", "multiple"]
+    print("\n=== offsets between execution paths, grouped by what differs ===")
+    hdr = f"{'what differs':>15} {'n pairs':>8} " + " ".join(f"{'L'+str(l):>11}" for l in layers_shown)
+    print(hdr); print("-" * len(hdr))
+    for kind in kinds:
+        rows = [v for v in result["pairs"].values() if v["kind"] == kind]
+        if not rows:
+            continue
+        cells = []
+        for l in layers_shown:
+            offs = sorted(r["layers"][l]["offset"] for r in rows
+                          if r["layers"].get(l, {}).get("offset") is not None)
+            cells.append(f"{offs[len(offs)//2]:>11.3e}" if offs else f"{'-':>11}")
+        print(f"{kind:>15} {len(rows):>8} " + " ".join(cells))
+    print("\n  (median over pairs; the full matrix is in the JSON)")
+
+    print("\n=== spread across ALL path pairs, per layer ===")
+    hdr = f"{'layer':>6} {'min':>12} {'median':>12} {'max':>12} {'max/min':>9}"
+    print(hdr); print("-" * len(hdr))
+    for l in layers_shown:
+        offs = sorted(v["layers"][l]["offset"] for v in result["pairs"].values()
+                      if v["layers"].get(l, {}).get("offset") is not None)
+        if not offs:
+            continue
+        lo, hi = offs[0], offs[-1]
+        med = offs[len(offs) // 2]
+        ratio = f"{hi/lo:>9.1f}" if lo > 0 else f"{'inf':>9}"
+        print(f"{l:>6} {lo:>12.3e} {med:>12.3e} {hi:>12.3e} {ratio}")
+    print("\n  A narrow spread here is the claim that every valid execution path")
+    print("  differs from every other by about the same amount. A wide one is not.")
 
 
 def main() -> None:
@@ -297,8 +347,11 @@ def main() -> None:
                         help="comma-separated policy:dim_batch[:draws], e.g. "
                              "'all:8:12,none:8:6' (default: all four arms). The "
                              "per-arm count matters: see parse_arms")
-    parser.add_argument("--keep", action="store_true",
-                        help="keep the saved Jacobians instead of deleting them")
+    parser.add_argument("--discard-tensors", action="store_true",
+                        help="delete the saved Jacobians when done. NOT the default: "
+                             "the analysis has already been rebuilt once, and "
+                             "re-analysing costs minutes where re-running the grid "
+                             "costs hours")
     parser.add_argument("--child")
     parser.add_argument("--dim-batch", type=int)
     parser.add_argument("--compile-layers")
@@ -378,70 +431,29 @@ def main() -> None:
                          for i, c in enumerate(clusters))
         print(f"  {arm[0]}:{arm[1]}@p{arm[2]} -> {len(clusters)} variant(s)  [{vals}]")
 
-    results = {}
-    null = noise_pairs(draws)
-    variant_term: dict[tuple, dict[int, float]] = {}
-
-    # 1. variants, within one arm at a time. Same arm and same variant is the only
-    #    grouping where "within" is pure noise, so this one needs no supplied null.
-    for arm in sorted({d["arm"] for d in draws}):
-        members = [d for d in draws if d["arm"] == arm]
-        if len({d["variant"] for d in members}) < 2:
-            print(f"\n  {arm[0]}:{arm[1]}@p{arm[2]}: one variant only"
-                  f" -- no variant comparison")
-            continue
-        name = f"variant offset, {arm[0]}:{arm[1]} @prompt{arm[2]}"
-        results[name] = decompose(members, lambda d: d["variant"], name)
-        variant_term[arm] = {l: (r.get("offset") or 0.0)
-                             for l, r in results[name]["layers"].items()}
-        report(name, results[name])
-
-    # A cross-arm pair differs by the arm AND by whichever variants it drew, so the
-    # variant term is removed too. Use the largest of the arms involved: it is the
-    # conservative choice, leaving the arm offset understated rather than inflated.
-    def worst_variant_term(arms) -> dict[int, float]:
-        terms = [variant_term[a] for a in arms if a in variant_term]
-        if not terms:
-            return {}
-        return {l: max(t.get(l, 0.0) for t in terms) for l in terms[0]}
-
-    # 2. configurations, at fixed dim_batch
-    for db, q in sorted({(d["dim_batch"], d["prompt_idx"]) for d in draws}):
-        members = [d for d in draws if d["dim_batch"] == db and d["prompt_idx"] == q]
-        if len({d["compile_layers"] for d in members}) < 2:
-            continue
-        name = f"configuration offset, dim_batch={db} @prompt{q}"
-        results[name] = decompose(members, lambda d: d["compile_layers"], name,
-                                  null=null,
-                                  subtract=worst_variant_term({d["arm"] for d in members}))
-        report(name, results[name])
-
-    # 3. dim_batch, at fixed configuration
-    for policy, q in sorted({(d["compile_layers"], d["prompt_idx"]) for d in draws}):
-        members = [d for d in draws
-                   if d["compile_layers"] == policy and d["prompt_idx"] == q]
-        if len({d["dim_batch"] for d in members}) < 2:
-            continue
-        name = f"dim_batch offset, {policy} @prompt{q}"
-        results[name] = decompose(members, lambda d: d["dim_batch"], name,
-                                  null=null,
-                                  subtract=worst_variant_term({d["arm"] for d in members}))
-        report(name, results[name])
+    results = analyse(draws)
+    report(results)
 
     dest = out / "offset_profile.json"
     dest.write_text(json.dumps(
         {"task": "offset-profile", "machine": cfg.machine, "model": MODEL_ID,
          "arms": [list(a) for a in arms],
          "n_sound": len(draws), "n_dropped": dropped,
+         "groups": results["groups"], "noise_rms": results["noise_rms"],
          "draws": [{k: v for k, v in d.items() if k not in ("arm", "tensors")}
                    for d in draws],
-         "results": results}, indent=2, default=str) + "\n")
+         "results": results["pairs"]}, indent=2, default=str) + "\n")
     print(f"\nwrote {dest}")
 
-    if not args.keep:
+    if args.discard_tensors:
         for d in draws:
             Path(d["path"]).unlink(missing_ok=True)
-        print(f"removed the saved Jacobians (pass --keep to retain them)")
+        print("removed the saved Jacobians")
+    else:
+        held = sum(1 for d in draws if Path(d["path"]).exists())
+        print(f"kept {held} Jacobians under {scratch} "
+              f"(~{held * 96 / 1024:.1f} GB) so the analysis can be redone without "
+              f"re-running the grid; --discard-tensors to drop them")
 
 
 if __name__ == "__main__":
