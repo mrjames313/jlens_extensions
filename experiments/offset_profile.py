@@ -99,15 +99,37 @@ IDENTITY_TOL = 0.01
 DEFAULT_ARMS = (("all", 8), ("linear-attn", 8), ("none", 8), ("linear-attn", 64))
 
 
-def parse_arms(spec: str | None) -> list[tuple[str, int]]:
+def parse_arms(spec: str | None, default_draws: int) -> list[tuple[str, int, int]]:
+    """``policy:dim_batch[:draws]``, comma-separated. Returns (policy, dim_batch, draws).
+
+    Draws are per-arm because the arms do not need the same number, and giving them
+    the same number spends the budget in the wrong places. Two effects set the
+    requirement:
+
+    * **Miscompilation losses.** An `all`-blocks arm loses ~37% of its draws to the
+      gate (`f-2026-08-28-compile-miscompilation`, pooled over three soaks), so 8
+      draws leave ~5 sound and ~2.5 per variant. `none` loses none.
+    * **How lopsided the variant split is.** At a balanced arm 8 draws miss a variant
+      0.4% of the time; at a skewed one -- `linear-attn:64` drew 7:1 -- the same 8
+      draws miss it 34% of the time, and a variant seen once contributes no averaging
+      at all to its own offset estimate.
+
+    `none` is uncompiled and therefore single-variant, so it needs draws only for its
+    noise null and can be the cheapest row despite being the slowest per draw.
+    """
     if not spec:
-        return list(DEFAULT_ARMS)
+        return [(p, d, default_draws) for p, d in DEFAULT_ARMS]
     arms = []
     for item in spec.split(","):
-        policy, _, db = item.strip().partition(":")
+        parts = [x for x in item.strip().split(":") if x != ""]
+        if not parts:
+            continue
+        policy = parts[0]
         if policy not in ("all", "linear-attn", "full-attn", "none"):
             raise SystemExit(f"unknown compile policy {policy!r} in --arms")
-        arms.append((policy, int(db or 8)))
+        db = int(parts[1]) if len(parts) > 1 else 8
+        draws = int(parts[2]) if len(parts) > 2 else default_draws
+        arms.append((policy, db, draws))
     return arms
 
 
@@ -257,11 +279,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--draws", type=int, default=8,
-                        help="draws per arm (default 8; the all-blocks arm loses "
-                             "~37%% of them to miscompilation)")
+                        help="default draws per arm, when --arms does not give a "
+                             "per-arm count (default 8)")
     parser.add_argument("--arms", default=None,
-                        help="comma-separated policy:dim_batch, e.g. "
-                             "'linear-attn:8,none:8' (default: all four)")
+                        help="comma-separated policy:dim_batch[:draws], e.g. "
+                             "'all:8:12,none:8:6' (default: all four arms). The "
+                             "per-arm count matters: see parse_arms")
     parser.add_argument("--keep", action="store_true",
                         help="keep the saved Jacobians instead of deleting them")
     parser.add_argument("--child")
@@ -274,17 +297,30 @@ def main() -> None:
         emit_result(child_draw(args.dim_batch, args.compile_layers, Path(args.out)))
         return
 
-    arms = parse_arms(args.arms)
+    arms = parse_arms(args.arms, args.draws)
     scratch = cfg.scratch_root / "offset-profile"
+    out = cfg.artifact_root / "measurements" / "offset-profile"
+    out.mkdir(parents=True, exist_ok=True)
+    #: Per-draw cost, seconds, by policy -- compiled arms run at roughly half the
+    #: uncompiled rate, and the estimate is what tells an unattended run whether it
+    #: fits the budget before it starts rather than after.
+    COST_S = {"all": 47, "linear-attn": 47, "full-attn": 60, "none": 72}
+    total_draws = sum(n for _, _, n in arms)
+    est_min = sum(n * COST_S.get(p, 55) for p, _, n in arms) / 60
     print(f"machine={cfg.machine}  model={MODEL_ID}")
-    print(f"{len(arms)} arms x {args.draws} draws, each in its own process.")
-    print(f"Arms: {', '.join(f'{p}:{d}' for p, d in arms)}")
-    print(f"Roughly {len(arms) * args.draws * 55 // 60} minutes.\n")
+    print(f"{len(arms)} arms, {total_draws} draws, each in its own process.")
+    print(f"Arms: {', '.join(f'{p}:{d}x{n}' for p, d, n in arms)}")
+    print(f"Estimated {est_min:.0f} minutes of draws, then a few minutes of analysis.")
+    print(f"Analysis holds every draw in memory: ~{total_draws * 96 / 1024:.1f} GB.\n")
 
     draws: list[dict] = []
     dropped = 0
-    for policy, db in arms:
-        for rep in range(args.draws):
+    # Written after every draw. An unattended run that dies partway then leaves both
+    # the manifest and the tensors on disk, so the completed arms stay analysable
+    # instead of costing the whole sitting.
+    progress = out / "offset_profile_progress.json"
+    for policy, db, n_draws in arms:
+        for rep in range(n_draws):
             tag = f"{policy}-db{db}-r{rep}"
             dest = scratch / f"{tag}.pt"
             r = run_child(__file__, tag, ["--child", "draw", "--dim-batch", str(db),
@@ -302,6 +338,10 @@ def main() -> None:
                 dropped += 1
                 continue
             draws.append(r)
+            progress.write_text(json.dumps(
+                {"complete": False, "n_sound": len(draws), "n_dropped": dropped,
+                 "arms": [list(a) for a in arms], "draws": draws}, indent=2,
+                default=str) + "\n")
 
     print(f"\n{len(draws)} sound draws, {dropped} dropped as miscompiled.")
     load_tensors(draws)
@@ -368,12 +408,10 @@ def main() -> None:
                                   subtract=worst_variant_term({d["arm"] for d in members}))
         report(name, results[name])
 
-    out = cfg.artifact_root / "measurements" / "offset-profile"
-    out.mkdir(parents=True, exist_ok=True)
     dest = out / "offset_profile.json"
     dest.write_text(json.dumps(
         {"task": "offset-profile", "machine": cfg.machine, "model": MODEL_ID,
-         "draws_per_arm": args.draws, "arms": [list(a) for a in arms],
+         "arms": [list(a) for a in arms],
          "n_sound": len(draws), "n_dropped": dropped,
          "draws": [{k: v for k, v in d.items() if k not in ("arm", "tensors")}
                    for d in draws],
