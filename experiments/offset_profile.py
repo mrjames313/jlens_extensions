@@ -420,8 +420,10 @@ def reanalyse(manifest: Path, screen: bool = False) -> None:
     load_tensors(draws)
     assign_variants(draws)
     if screen:
+        before = len(draws)
         draws = screen_groups(draws)
-        assign_variants(draws)
+        if len(draws) != before:
+            assign_variants(draws)
     results = analyse(draws)
     report(results)
     dest = manifest.with_name(manifest.stem + "_reanalysed.json")
@@ -601,7 +603,8 @@ def main() -> None:
     all_sound = list(draws)
     if args.screen:
         draws = screen_groups(draws)
-        assign_variants(draws)
+        if len(draws) != len(all_sound):
+            assign_variants(draws)
     results = analyse(draws)
     report(results)
 
