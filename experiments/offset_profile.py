@@ -419,7 +419,7 @@ def reanalyse(manifest: Path, screen: bool = False) -> None:
         raise SystemExit("no saved tensors to re-analyse; the run must keep them")
     load_tensors(draws)
     assign_variants(draws)
-    if args.screen:
+    if screen:
         draws = screen_groups(draws)
         assign_variants(draws)
     results = analyse(draws)
