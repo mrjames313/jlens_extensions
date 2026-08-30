@@ -185,13 +185,24 @@ def child_run(label: str, policy: str, targets: tuple[int, ...]) -> dict:
 
 
 def load_at(runs: list[dict], n: int) -> dict[str, dict]:
+    """Load each run's lens at prompt count ``n``, as ``{layer: fp32 tensor}``.
+
+    Through ``JacobianLens.load``, not a bare ``torch.load``: ``lens.save`` writes a
+    envelope -- ``{"J": {...}, "n_prompts": ..., "source_layers": ..., "d_model": ...}``
+    -- so loading it raw yields those four keys and ``A[layer]`` returns a nested dict
+    rather than a tensor. `envelope_vs_n.py` already did it this way; not following it
+    is what broke the first run of this driver *after* its 93 minutes of fitting.
+    """
     import torch
+
+    from jlens.lens import JacobianLens
 
     out = {}
     for r in runs:
         path = r["snapshots"].get(str(n)) or r["snapshots"].get(n)
         if path and Path(path).exists():
-            out[r["label"]] = torch.load(path, map_location="cpu")
+            lens = JacobianLens.load(str(path))
+            out[r["label"]] = {k: v.to(torch.float32) for k, v in lens.jacobians.items()}
     return out
 
 
