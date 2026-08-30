@@ -237,15 +237,27 @@ def offsets_at(runs: list[dict], n: int) -> dict[str, dict[int, dict]]:
     return out
 
 
-def analyse(runs: list[dict], targets: tuple[int, ...]) -> dict:
+def analyse(runs: list[dict], targets: tuple[int, ...], fit_from: int = 1) -> dict:
+    """Offsets at every target; exponent fitted only over ``n >= fit_from``.
+
+    The two are separated because the exponent may not be constant in ``n``. If the
+    per-prompt differences are slightly positively correlated -- which is what
+    `f-2026-08-27-envelope-scaling` invoked to explain alpha = 0.473 rather than 0.5
+    -- then correlation bites harder the more terms are averaged, and a fit weighted
+    toward small ``n`` reads higher. The first run of this driver fitted from n=1 and
+    its within-variant control came out at 0.502 against a reference of 0.473
+    measured over n=5..233. Refitting from n=5 tests that directly, on snapshots
+    already on disk.
+    """
     per_n = {n: offsets_at(runs, n) for n in targets}
+    fit_targets = tuple(n for n in targets if n >= fit_from)
     kinds = sorted({k for v in per_n.values() for k in v})
     layers = sorted({l for v in per_n.values() for k in v.values() for l in k})
     fits: dict[str, dict[int, dict]] = {}
     for kind in kinds:
         for layer in layers:
             points = []
-            for n in targets:
+            for n in fit_targets:
                 row = per_n.get(n, {}).get(kind, {}).get(layer)
                 if row and row.get("offset"):
                     points.append((n, row["offset"]))
@@ -254,7 +266,8 @@ def analyse(runs: list[dict], targets: tuple[int, ...]) -> dict:
                     fits.setdefault(kind, {})[layer] = fit_power_law(points)
                 except ValueError:
                     pass
-    return {"per_n": per_n, "fits": fits, "targets": list(targets)}
+    return {"per_n": per_n, "fits": fits, "targets": list(targets),
+            "fit_targets": list(fit_targets)}
 
 
 def report(result: dict, runs: list[dict], layers_shown=(0, 4, 8, 15, 22)) -> None:
@@ -274,7 +287,8 @@ def report(result: dict, runs: list[dict], layers_shown=(0, 4, 8, 15, 22)) -> No
                          else f"{'-':>11}")
         print(f"{kind:>16} " + " ".join(cells))
 
-    print("\n=== fitted exponent, per layer ===")
+    print(f"\n=== fitted exponent, per layer  (fitted over n = "
+          f"{', '.join(str(n) for n in result['fit_targets'])}) ===")
     print("  alpha 0.5 = per-prompt differences independent; 0 = systematic, never averages down")
     hdr = f"{'kind':>16} " + " ".join(f"{('L' + str(l)):>18}" for l in layers_shown)
     print(hdr); print("-" * len(hdr))
@@ -312,6 +326,10 @@ def main() -> None:
                              "~50/50 at linear-attn:8, so 6 gives both with ~97%% odds)")
     parser.add_argument("--max-n", type=int, default=max(DEFAULT_TARGETS))
     parser.add_argument("--policies", default=",".join(DEFAULT_POLICIES))
+    parser.add_argument("--fit-from", type=int, default=1, metavar="N",
+                        help="fit the exponent only over prompt counts >= N. Use 5 to "
+                             "match the range envelope_vs_n measured 0.473 over; the "
+                             "exponent need not be constant in n (see analyse)")
     parser.add_argument("--analyse-only", action="store_true",
                         help="skip fitting; re-tabulate from saved snapshots")
     parser.add_argument("--child")
@@ -363,12 +381,14 @@ def main() -> None:
             for i in cluster:
                 members[i]["variant"] = vi
 
-    result = analyse(sound, targets)
+    result = analyse(sound, targets, fit_from=args.fit_from)
     report(result, sound)
     dest = out_root() / "cross_path_scaling.json"
     dest.write_text(json.dumps(
         {"task": "cross-path-scaling", "machine": cfg.machine, "model": MODEL_ID,
          "dim_batch": DIM_BATCH, "targets": list(targets),
+         "fit_targets": result["fit_targets"],
+         "per_n": result["per_n"],
          "runs": [{k: v for k, v in r.items() if k != "snapshots"} for r in sound],
          "fits": result["fits"]}, indent=2, default=str) + "\n")
     print(f"\nwrote {dest}")
