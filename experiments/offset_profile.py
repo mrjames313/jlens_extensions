@@ -598,6 +598,7 @@ def main() -> None:
           f"(their tensors are kept too -- a drop is a gate verdict, not a fact).")
     load_tensors(draws)
     assign_variants(draws)
+    all_sound = list(draws)
     if args.screen:
         draws = screen_groups(draws)
         assign_variants(draws)
@@ -612,8 +613,12 @@ def main() -> None:
          "rejected": [{k: v for k, v in d.items() if k != "tensors"}
                       for d in rejected],
          "groups": results["groups"], "noise_rms": results["noise_rms"],
-         "draws": [{k: v for k, v in d.items() if k not in ("arm", "tensors")}
-                   for d in draws],
+         # Every sound draw, screened or not, with a flag. A screen verdict is a
+         # verdict; recording only the survivors would make it unrevisitable, which
+         # is the mistake already fixed for the identity gate.
+         "draws": [{**{k: v for k, v in d.items() if k not in ("arm", "tensors")},
+                    "screened_out": d not in draws}
+                   for d in all_sound],
          "results": results["pairs"]}, indent=2, default=str) + "\n")
     print(f"\nwrote {dest}")
 

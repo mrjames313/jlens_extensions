@@ -119,37 +119,43 @@ def identity_in_band(value: float, expected: float, tol: float = IDENTITY_TOL) -
 
 
 def cluster_variants(values: Sequence[float], *,
-                     rel_gap: float = 1e-5) -> list[list[int]]:
-    """Group sound ``identity_distance`` readings into compile variants.
+                     rel_gap: float = 0.0) -> list[list[int]]:
+    """Group ``identity_distance`` readings into compile variants.
 
-    A compiled process draws one of a small number of numerically distinct but
-    equally sound compilations. On Qwen3.5-0.8B at torch 2.13.0 there are two
-    whenever the linear-attention blocks are compiled -- 0.531268/0.531295 with all
-    blocks, 0.531430/0.531469 with linear-attention only -- and one otherwise
-    (`f-2026-08-28-compile-miscompilation`). Which variant a fit drew is a property
-    of the *process*, and two fits that drew different ones differ by a systematic
-    term that no run-to-run envelope describes.
+    A compiled process draws one of a small number of numerically distinct but equally
+    sound compilations (`f-2026-08-28-compile-miscompilation`). Which one a fit drew is
+    a property of the *process*, and two fits on different variants differ by a
+    systematic term no run-to-run envelope describes.
 
-    Returns a list of clusters, each a list of indices into ``values``, ordered by
-    the cluster's smallest value. Splits wherever consecutive sorted values are more
-    than ``rel_gap`` apart in relative terms.
+    Returns clusters of indices into ``values``, ordered by each cluster's smallest
+    value.
 
-    **Discovered, not tabulated.** A per-model table of known variant values would
-    need updating for every new model and torch build, and would fail silently when
-    out of date -- the argument that made
-    ``d-2026-08-25-probe-norm-gain`` probe the module instead of reading a
-    convention. The variants are far better separated from each other than the
-    within-variant spread (which is zero to six decimals on repeats), so clustering
-    on a gap recovers them from the data alone.
+    **Grouping is exact by default, and that is the whole point.** A variant is a fixed
+    set of kernels computing a deterministic result, so within one variant the reading
+    repeats *bit for bit* -- observed in every group of every run to date. Any distinct
+    value is therefore a distinct variant, and no threshold is needed to say so.
 
-    The default ``rel_gap`` sits between the two scales it has to tell apart, with
-    about 5x margin on each side: repeats *within* a variant agree to six decimals
-    (~2e-6 relative), while the variants are 5.1e-5 apart with all blocks compiled
-    and 7.3e-5 with linear-attention only. A threshold at the variant separation
-    itself would have had 1.6% margin and split on noise.
+    The two failure modes are not symmetric, which is what settles the default:
 
-    Pass only sound values. A miscompiled reading is not a variant and will form its
-    own spurious cluster; filter with :func:`identity_in_band` first.
+    * **Splitting** one variant in two (if a reading ever jitters in its last bits)
+      creates a spurious cross-variant pair whose offset is pure noise, and
+      :func:`~jlens_extensions.compare.group_offset` reports it unresolved. Benign.
+    * **Merging** two variants puts them in one group, so the group's own spread
+      carries the variant offset and every null computed from it is inflated.
+      Malignant, and silent.
+
+    An earlier default of ``rel_gap=1e-5`` did exactly that. Variant separations are
+    themselves prompt-dependent, measured from 5.4e-6 to 1.8e-4 -- a 34x range with no
+    room for a fixed threshold inside it -- so a 1e-5 gap merged the variants on two
+    prompts of six and contaminated their nulls. The contamination screen caught it,
+    at the cost of the twenty draws it had to discard.
+
+    ``rel_gap`` is kept for the case where a future model genuinely does jitter within
+    a variant; set it only with measured evidence of that jitter, and keep it far
+    below the smallest separation observed on that model.
+
+    Pass only sound values. A miscompiled reading is not a variant; filter with
+    :func:`identity_in_band` first.
     """
     if not values:
         return []

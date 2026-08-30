@@ -259,17 +259,23 @@ def test_cluster_variants_splits_the_linear_attn_pair_too():
     assert len(clusters) == 2
 
 
-def test_cluster_variants_keeps_one_variant_together():
-    # Uncompiled repeats agree to six decimals; sixth-decimal jitter is not a variant.
-    clusters = cluster_variants([0.531523, 0.531523, 0.531524])
-    assert len(clusters) == 1
+def test_cluster_variants_groups_exactly_repeated_readings():
+    """Within a variant the reading repeats bit for bit, so exact grouping is right."""
+    assert len(cluster_variants([0.531523, 0.531523, 0.531523])) == 1
 
 
-def test_cluster_variants_default_gap_has_margin_on_both_sides():
-    """The threshold must sit between within-variant jitter and variant separation."""
-    within = 1e-6 / 0.5314          # six-decimal jitter, relative
-    between = 2.7e-5 / 0.531268     # the tighter of the two real separations
-    assert within * 4 < 1e-5 < between / 4
+def test_cluster_variants_splits_a_distinct_value_however_close():
+    """Separations run 5.4e-6 to 1.8e-4 across prompts, so no fixed gap works.
+
+    A 1e-5 default merged the two variants on two prompts of six and inflated their
+    nulls; splitting a variant by mistake is merely wasteful, merging two is silent.
+    """
+    assert len(cluster_variants([0.556030, 0.556033, 0.556030])) == 2
+    assert len(cluster_variants([0.555890, 0.555894])) == 2
+
+
+def test_cluster_variants_rel_gap_still_available_for_real_jitter():
+    assert len(cluster_variants([0.531523, 0.531524], rel_gap=1e-5)) == 1
 
 
 def test_cluster_variants_empty():
