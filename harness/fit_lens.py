@@ -143,6 +143,7 @@ class ConvergenceTracker:
     ) -> None:
         self.gate_identity = gate_identity
         self.gate_tol = gate_tol
+        self._first_seq_len: int | None = None
         self.csv_path = csv_path
         self.thresholds = thresholds
         self.stop_at_delta = stop_at_delta
@@ -178,6 +179,14 @@ class ConvergenceTracker:
                 p.identity_distance, self.gate_identity, tol=self.gate_tol,
                 n_done=p.n_done, context="Aborting the fit before it writes a lens.",
             )
+        # One fit is one compile draw only while the shape stays put; a new shape
+        # recompiles and draws a fresh variant, which the prompt-1 gate cannot see.
+        if self._first_seq_len is None:
+            self._first_seq_len = p.seq_len
+        else:
+            from jlens_extensions.compile_policy import check_shape_stable
+
+            check_shape_stable(p.seq_len, self._first_seq_len, p.n_done)
         self._writer.writerow(
             [
                 p.n_done,

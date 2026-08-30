@@ -16,10 +16,12 @@ from jlens_extensions.compile_policy import (
     DEFAULT_POLICY,
     IDENTITY_TOL,
     CompileGateError,
+    ShapeDriftError,
     check_identity_gate,
     classify_blocks,
     cluster_variants,
     identity_in_band,
+    check_shape_stable,
     select_block_indices,
 )
 
@@ -280,3 +282,26 @@ def test_cluster_variants_rel_gap_still_available_for_real_jitter():
 
 def test_cluster_variants_empty():
     assert cluster_variants([]) == []
+
+
+# --- shape stability --------------------------------------------------------
+
+
+def test_check_shape_stable_passes_a_constant_shape():
+    assert check_shape_stable(128, 128, 42) is None
+
+
+def test_check_shape_stable_rejects_a_changed_shape():
+    """A new shape recompiles under dynamic=False, so prompt 1 no longer covers the run."""
+    with pytest.raises(ShapeDriftError) as exc:
+        check_shape_stable(96, 128, 17)
+    msg = str(exc.value)
+    assert "128" in msg and "96" in msg and "prompt 17" in msg
+    assert "gate" in msg
+
+
+def test_shape_guard_names_a_way_out():
+    """An error a reader cannot act on is only half a guard."""
+    with pytest.raises(ShapeDriftError) as exc:
+        check_shape_stable(64, 128, 3)
+    assert "--compile_blocks none" in str(exc.value)

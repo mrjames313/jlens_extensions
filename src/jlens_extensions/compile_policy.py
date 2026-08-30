@@ -94,12 +94,16 @@ def apply_compile_policy(model: Any, policy: str = DEFAULT_POLICY) -> dict[str, 
     """
     import torch
 
+    # Before anything is compiled: past the recompile limit dynamo graph-breaks and
+    # can corrupt gradients silently, and the flag defaults off. See harden_dynamo.
+    hardened = harden_dynamo()
     chosen = select_block_indices(model.layers, policy)
     for i in chosen:
         model.layers[i] = torch.compile(model.layers[i], mode="default", dynamic=False)
     kinds = classify_blocks(model.layers)
     return {
         "policy": policy,
+        "dynamo_hardened": hardened,
         "compiled_indices": chosen,
         "n_compiled": len(chosen),
         "n_blocks": len(model.layers),
@@ -107,6 +111,57 @@ def apply_compile_policy(model: Any, policy: str = DEFAULT_POLICY) -> dict[str, 
         "n_full_attn": len(kinds["full-attn"]),
         "hybrid": bool(kinds["linear-attn"]) and bool(kinds["full-attn"]),
     }
+
+
+class ShapeDriftError(RuntimeError):
+    """A fit's input shape changed, so the compiled code it was gated on was replaced."""
+
+
+def harden_dynamo() -> dict[str, Any]:
+    """Turn dynamo's silent recompile-limit failure into a hard error.
+
+    Past ``recompile_limit`` (8) dynamo stops compiling and graph-breaks, and
+    NVIDIA/Megatron-LM#1888 reports gradients "likely incorrect, causing training to
+    fail silently" in that mode. We saw the warning ourselves in the early
+    four-configurations-in-one-process diagnostics.
+
+    ``fail_on_recompile_limit_hit`` defaults to ``False`` in torch 2.13.0, so this is
+    off unless asked for. `f-2026-08-28-compile-miscompilation` recommended setting it
+    "regardless" and nothing did until now.
+    """
+    import torch
+
+    before = getattr(torch.compiler.config, "fail_on_recompile_limit_hit", None)
+    if before is None:
+        return {"hardened": False, "reason": "flag absent in this torch build"}
+    torch.compiler.config.fail_on_recompile_limit_hit = True
+    return {"hardened": True, "was": before}
+
+
+def check_shape_stable(seq_len: int, first_seq_len: int, n_done: int) -> None:
+    """Every prompt must present the shape the compiled code was built for.
+
+    The prompt-1 identity gate rests on one fit being **one draw**: compile once at
+    prompt 1, reuse for every prompt after. That holds only while the input shape is
+    constant. ``max_seq_len`` *truncates* rather than pads, so a corpus whose prompts
+    tokenize shorter than the cap yields varying ``seq_len`` -- and under
+    ``dynamic=False`` each new shape triggers a **recompile**, which draws a fresh
+    compile variant mid-fit. Prompt 1 would then no longer speak for the rest of the
+    run, and the gate would report green over a lens built from several compilations.
+
+    Our 233-prompt corpus happens to give ``seq_len 128`` on every row, so this has
+    never fired. That is a property of the corpus, not of the code, and nothing
+    checked it. ``seq_len`` is already written to every row of the convergence CSV, so
+    this also validates retroactively on every fit we hold.
+    """
+    if seq_len == first_seq_len:
+        return
+    raise ShapeDriftError(
+        f"seq_len changed from {first_seq_len} at prompt 1 to {seq_len} at prompt "
+        f"{n_done}. Under dynamic=False a new shape recompiles, so this run is no "
+        f"longer one compile draw and the prompt-1 gate no longer covers it. Pad or "
+        f"filter the corpus to a constant length, or fit with --compile_blocks none."
+    )
 
 
 def identity_in_band(value: float, expected: float, tol: float = IDENTITY_TOL) -> bool:
