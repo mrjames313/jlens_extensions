@@ -110,6 +110,71 @@ def build_fit_command(
     return cmd
 
 
+def measure_prompt1_identity(
+    model_id: str,
+    *,
+    prompt: str,
+    policy: str = "none",
+    dim_batch: int = 8,
+    max_seq_len: int = 128,
+) -> dict[str, Any]:
+    """Measure prompt 1's ``identity_distance`` under one compile policy.
+
+    The single implementation behind both the gate's *reference* (``policy="none"``,
+    via :func:`probe_reference_identity`) and the compile soak that checks a policy is
+    sound. **They must share this code.** The soak's whole output is a comparison of its
+    draws against the stored ``gate_identity``, and if the two computed the statistic
+    even slightly differently -- a different ``dim_batch``, a different source-layer
+    range, a float32 cast in one and not the other -- that comparison would be
+    measuring the difference between two implementations rather than between two
+    compilations.
+
+    ``policy`` is applied *after* ``from_hf(compile=False)``, so the vendored library
+    stays as Neuronpedia wrote it. See :mod:`jlens_extensions.compile_policy`.
+
+    Assumes ``jlens`` is importable, i.e. the caller has ``harness/`` on ``sys.path``
+    the way ``fit_lens.py`` does.
+    """
+    import torch
+    import transformers
+
+    import jlens
+    from jlens.fitting import jacobian_for_prompt
+
+    from jlens_extensions.compile_policy import apply_compile_policy
+
+    hf = transformers.AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.bfloat16
+    ).cuda()
+    tok = transformers.AutoTokenizer.from_pretrained(model_id)
+    model = jlens.from_hf(hf, tok, compile=False)
+
+    compiled: dict[str, Any] = {"policy": "none", "n_compiled": 0}
+    if policy != "none":
+        compiled = apply_compile_policy(model, policy)
+
+    source_layers = list(range(model.n_layers - 1))
+    J, seq_len, n_valid = jacobian_for_prompt(
+        model, prompt, source_layers, target_layer=None,
+        dim_batch=dim_batch, max_seq_len=max_seq_len,
+    )
+    late = max(source_layers)
+    d_model = J[late].shape[0]
+    identity = (J[late].float() - torch.eye(d_model)).norm().item() / d_model**0.5
+    basis = "uncompiled single prompt" if policy == "none" else f"{policy} compiled single prompt"
+    return {
+        "identity_distance": identity,
+        "basis": basis,
+        "model": model_id,
+        "policy": policy,
+        "compiled": compiled,
+        "dim_batch": dim_batch,
+        "max_seq_len": max_seq_len,
+        "seq_len": seq_len,
+        "n_valid_positions": n_valid,
+    }
+
+
 def probe_reference_identity(
     model_id: str,
     *,
@@ -123,36 +188,8 @@ def probe_reference_identity(
     to six decimal places. About 90 seconds, and it makes the gate self-contained --
     no per-model constant to look up, and nothing to go stale when a model or corpus
     changes.
-
-    Assumes ``jlens`` is importable, i.e. the caller has ``harness/`` on ``sys.path``
-    the way ``fit_lens.py`` does.
     """
-    import torch
-    import transformers
-
-    import jlens
-    from jlens.fitting import jacobian_for_prompt
-
-    hf = transformers.AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16
-    ).cuda()
-    tok = transformers.AutoTokenizer.from_pretrained(model_id)
-    model = jlens.from_hf(hf, tok, compile=False)
-
-    source_layers = list(range(model.n_layers - 1))
-    J, seq_len, n_valid = jacobian_for_prompt(
-        model, prompt, source_layers, target_layer=None,
+    return measure_prompt1_identity(
+        model_id, prompt=prompt, policy="none",
         dim_batch=dim_batch, max_seq_len=max_seq_len,
     )
-    late = max(source_layers)
-    d_model = J[late].shape[0]
-    identity = (J[late].float() - torch.eye(d_model)).norm().item() / d_model**0.5
-    return {
-        "identity_distance": identity,
-        "basis": "uncompiled single prompt",
-        "model": model_id,
-        "dim_batch": dim_batch,
-        "max_seq_len": max_seq_len,
-        "seq_len": seq_len,
-        "n_valid_positions": n_valid,
-    }

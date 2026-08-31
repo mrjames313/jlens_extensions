@@ -48,6 +48,8 @@ later spec's numbering cannot collide with them.
 ## Drivers
 
 | Driver | Task | Produces |
+| `compile_soak.py` | Whether a compile policy is sound on a given model: N draws, one process each (the miscompilation is per-process), reading prompt-1 `identity_distance` through the same `measure_prompt1_identity` the gate reference uses. Reports the discrete value structure of the in-band draws — a sound configuration repeats *exactly* within a variant — and refuses to claim soundness without a stored `gate_identity` to compare against. `--draws 6` checks the structure; `--draws 20` bounds the rate. |
+| `add_model_profile.py` | A machine-profile entry for a second model on a box already brought up, where `t13_write_profile.py` does not apply because there is no `dim_batch` sweep to assemble from. Records `dim_batch`/`s_per_prompt`/`peak_*` as **projections** — `measured_over_prompts=0` and a basis string that names the projection — and refuses to project `force_bos_effective`, which it reads from T10. |
 |---|---|---|
 | `t9_gamma_spread.py` | T9 | The γ spread for a model, the top-k dictionary overlap between the corrected and the paper's construction, and the vector/subspace divergence at a fixed token set. |
 | `t9_derivation_check.py` | T9 / any new model | Per-model validation: the norm's gain convention, and whether our dictionary construction reproduces the model's readout at equal precision. |
