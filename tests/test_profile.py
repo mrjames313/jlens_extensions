@@ -207,3 +207,75 @@ def test_compile_flag_can_be_flipped_without_touching_the_gate_reference(tmp_pat
     assert after.compile is True
     assert after.gate_identity == 0.522718
     assert after.gate_identity_basis == "uncompiled single prompt"
+
+
+# --- add_model_profile's CLI rules (band-location T15) -----------------------
+
+
+def _add_model_profile():
+    """Import the driver with a stubbed config, restoring sys.path.
+
+    Same pattern as tests/test_compile_soak.py: the driver calls jx_config.load() at
+    import, which raises off-box, and it puts harness/ on sys.path -- which would leak
+    and trip test_scaffold's assertion that harness/ is never importable.
+    """
+    import importlib.util
+    import sys
+    import types
+    from pathlib import Path as _Path
+
+    repo = _Path(__file__).resolve().parent.parent
+    stub = types.ModuleType("jlens_extensions.config")
+
+    class _Cfg:
+        machine = "test-box"
+        artifact_root = _Path("/tmp/does-not-exist")
+
+        def hf_env(self):
+            return {}
+
+    stub.load = lambda: _Cfg()
+    stub.ConfigError = RuntimeError
+    sys.modules["jlens_extensions.config"] = stub
+    saved_path = list(sys.path)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_add_model_profile", repo / "experiments" / "add_model_profile.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = saved_path
+        del sys.modules["jlens_extensions.config"]
+
+
+def test_set_compile_does_not_demand_the_projection_arguments():
+    """The verdict-recording path must not require re-passing dim_batch and basis.
+
+    It did, and the soak verdict could not be recorded without pasting the projections
+    back in -- which is precisely how a wrong dim_batch gets written to a profile that
+    a 30-hour fit then reads.
+    """
+    driver = _add_model_profile()
+    args = driver.build_parser().parse_args(
+        ["--model", "Qwen/Qwen3.5-4B", "--set-compile", "--compile"]
+    )
+    assert args.set_compile is True
+    assert args.compile is True
+    assert args.dim_batch is None and args.basis is None
+
+
+def test_adding_an_entry_still_requires_dim_batch_and_basis():
+    driver = _add_model_profile()
+    parser = driver.build_parser()
+    args = parser.parse_args(["--model", "M", "--no-compile"])
+    with pytest.raises(SystemExit):
+        driver.require_projection_args(parser, args)
+
+
+def test_compile_direction_is_always_explicit():
+    """Neither path may default the flag -- --set-compile has to say which way."""
+    driver = _add_model_profile()
+    with pytest.raises(SystemExit):
+        driver.build_parser().parse_args(["--model", "M", "--set-compile"])

@@ -69,15 +69,25 @@ def read_force_bos(model_id: str) -> bool:
     )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, separated from main() so its argument rules are testable off-box.
+
+    `--dim-batch` and `--basis` describe a *new* entry, so they are not required at the
+    parser level: `--set-compile` records a soak verdict against an entry that already
+    has them, and demanding them there would mean re-passing the projections just to
+    flip a boolean -- which is how the wrong ones get pasted in. They are enforced in
+    :func:`require_projection_args` for the add path instead.
+    """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--model", required=True)
-    parser.add_argument("--dim-batch", type=int, required=True)
+    parser.add_argument("--dim-batch", type=int,
+                        help="required unless --set-compile")
     parser.add_argument(
-        "--basis", required=True,
-        help='What kind of value dim_batch is. Say "assumed: ..." when projected.',
+        "--basis",
+        help='What kind of value dim_batch is. Say "assumed: ..." when projected. '
+             'Required unless --set-compile.',
     )
     parser.add_argument("--s-per-prompt", type=float, default=0.0, help="projected")
     parser.add_argument("--peak-alloc-gb", type=float, default=0.0, help="projected")
@@ -92,6 +102,23 @@ def main() -> None:
         help="update ONLY the compile flag on an existing entry and exit; the normal "
              "way to record a compile-soak verdict without disturbing anything measured",
     )
+    return parser
+
+
+def require_projection_args(parser: argparse.ArgumentParser, args) -> None:
+    """Enforce what the add path needs, once --set-compile has been ruled out."""
+    missing = [name for name, value in
+               (("--dim-batch", args.dim_batch), ("--basis", args.basis))
+               if value is None]
+    if missing:
+        parser.error(
+            f"the following arguments are required when adding an entry: "
+            f"{', '.join(missing)} (not needed with --set-compile)"
+        )
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     profile = MachineProfile.load(cfg.profile_path)
@@ -108,6 +135,7 @@ def main() -> None:
         print(f"  gate_identity {facts.gate_identity} preserved")
         return
 
+    require_projection_args(parser, args)
     if args.model in profile.models and not args.force:
         raise SystemExit(
             f"{cfg.profile_path} already has an entry for {args.model}. Pass --force to "
