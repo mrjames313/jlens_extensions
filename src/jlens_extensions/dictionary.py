@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import copy
 import math
+from typing import Mapping, Sequence
 
 import torch
 
@@ -66,6 +67,7 @@ __all__ = [
     "effective_gain",
     "corrected_unembedding",
     "dictionary_vectors",
+    "dictionary_stack",
     "lens_logits",
     "gain_spread",
 ]
@@ -271,3 +273,87 @@ def _check_shapes(
         raise ValueError(
             f"J_bar must be [{d_model}, {d_model}], got {tuple(J_bar.shape)}"
         )
+
+
+def dictionary_stack(
+    W_U: torch.Tensor,
+    gamma: torch.Tensor,
+    J_by_layer: "Mapping[int, torch.Tensor] | Sequence[torch.Tensor]",
+    token_ids: torch.Tensor,
+    *,
+    correct: bool = True,
+    layers: "Sequence[int] | None" = None,
+    dtype: torch.dtype | None = torch.float32,
+    max_gib: float = 8.0,
+) -> tuple[torch.Tensor, list[int]]:
+    """Dictionary vectors for one token set at every layer.
+
+    The shared input to S0 (CKA block structure) and S4 (effective linear
+    dimensionality), both of which read the J-lens vectors themselves and need no
+    corpus, and to the J-space readouts of the ignition control.
+
+    Returns ``([n_layers, k, d_model], layer_indices)``. The layer order is returned
+    alongside the tensor rather than left implicit: a `dict` of layers is not
+    guaranteed ordered by key, and a CKA matrix whose axes are silently permuted
+    looks exactly like a model without block structure.
+
+    Args:
+        W_U: Unembedding, ``[vocab, d_model]``.
+        gamma: Effective gain from :func:`effective_gain`, ``[d_model]``.
+        J_by_layer: Fitted Jacobians keyed by layer, or a sequence indexed by layer.
+        token_ids: Which vocabulary rows to form, ``[k]``.
+        correct: Fold ``gamma`` in. ``False`` gives the paper's literal ``W_U J_l``,
+            which is what you want only when measuring the difference between the two
+            constructions.
+        layers: Restrict to these layers, in this order. Defaults to every layer
+            present, ascending.
+        dtype: Accumulate in this dtype. Defaults to float32 -- the stored lenses are
+            fp16 and the downstream statistics are covariances and Gram matrices,
+            where accumulating in the storage dtype throws away bits the comparison
+            depends on. See ``f-2026-08-27-fp16-comparison-distortion``.
+        max_gib: Refuse above this. The stack is ``n_layers * k * d_model``, which is
+            easy to size wrongly by an order of magnitude -- 4096 tokens at 0.8B is
+            0.4 GiB and the same request at 27B is 26 GiB.
+
+    Raises:
+        ValueError: On a shape mismatch, an unknown layer, or a stack over ``max_gib``.
+    """
+    _check_shapes(W_U, gamma)
+    if token_ids.ndim != 1:
+        raise ValueError(f"token_ids must be 1-D, got {tuple(token_ids.shape)}")
+
+    if layers is None:
+        keys = sorted(J_by_layer.keys()) if hasattr(J_by_layer, "keys") \
+            else list(range(len(J_by_layer)))
+    else:
+        keys = list(layers)
+
+    d_model = W_U.shape[1]
+    k = int(token_ids.shape[0])
+    want = torch.empty((), dtype=dtype or W_U.dtype).element_size()
+    gib = len(keys) * k * d_model * want / 1024**3
+    if gib > max_gib:
+        raise ValueError(
+            f"stack would be {gib:.1f} GiB ({len(keys)} layers x {k} tokens x "
+            f"{d_model} dims); cap is {max_gib} GiB. Reduce the token set, restrict "
+            f"`layers`, or raise max_gib deliberately."
+        )
+
+    out = torch.empty((len(keys), k, d_model), dtype=dtype or W_U.dtype)
+    for row, layer in enumerate(keys):
+        try:
+            J = J_by_layer[layer]
+        except (KeyError, IndexError):
+            raise ValueError(
+                f"no Jacobian for layer {layer}; have "
+                f"{sorted(J_by_layer.keys()) if hasattr(J_by_layer, 'keys') else len(J_by_layer)}"
+            ) from None
+        vectors = dictionary_vectors(
+            W_U.to(dtype) if dtype else W_U,
+            gamma.to(dtype) if dtype else gamma,
+            J.to(dtype) if dtype else J,
+            token_ids,
+            correct=correct,
+        )
+        out[row] = vectors
+    return out, keys

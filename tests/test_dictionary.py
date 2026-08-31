@@ -23,6 +23,7 @@ torch = pytest.importorskip("torch")
 
 from jlens_extensions.dictionary import (  # noqa: E402
     corrected_unembedding,
+    dictionary_stack,
     dictionary_vectors,
     effective_gain,
     gain_spread,
@@ -256,3 +257,95 @@ def test_recovered_gain_ranks_correctly_where_the_raw_weight_does_not():
 
     assert torch.equal(ranks(reference), ranks(with_recovered))
     assert not torch.equal(ranks(reference), ranks(with_raw_weight))
+
+
+# --- dictionary_stack: the shared input to S0 and S4 (workspace-band-location T5) ---
+
+
+def _toy(vocab=64, d_model=8, n_layers=5, seed=0):
+    torch.manual_seed(seed)
+    W_U = torch.randn(vocab, d_model)
+    gamma = torch.rand(d_model) + 0.5
+    J = {layer: torch.randn(d_model, d_model) for layer in range(n_layers)}
+    return W_U, gamma, J
+
+
+def test_stack_matches_per_layer_construction_exactly():
+    """The stack must be the existing single-layer path, not a second implementation."""
+    W_U, gamma, J = _toy()
+    ids = torch.tensor([3, 9, 17])
+    stack, keys = dictionary_stack(W_U, gamma, J, ids)
+    assert keys == [0, 1, 2, 3, 4]
+    for row, layer in enumerate(keys):
+        expected = dictionary_vectors(
+            W_U.float(), gamma.float(), J[layer].float(), ids
+        )
+        assert torch.equal(stack[row], expected)
+
+
+def test_layer_order_is_returned_not_left_implicit():
+    """A permuted CKA axis looks exactly like a model with no block structure.
+
+    Dict iteration order follows insertion, so a lens loaded out of order would
+    silently produce a scrambled layer axis if the caller assumed sorted keys.
+    """
+    W_U, gamma, J = _toy(n_layers=4)
+    shuffled = {layer: J[layer] for layer in (2, 0, 3, 1)}
+    stack, keys = dictionary_stack(W_U, gamma, shuffled, torch.tensor([1, 2]))
+    assert keys == [0, 1, 2, 3], "keys must come back ascending, not in insertion order"
+    expected = dictionary_vectors(W_U.float(), gamma.float(), J[0].float(),
+                                  torch.tensor([1, 2]))
+    assert torch.equal(stack[0], expected)
+
+
+def test_explicit_layer_subset_is_honoured_in_the_given_order():
+    W_U, gamma, J = _toy(n_layers=6)
+    stack, keys = dictionary_stack(W_U, gamma, J, torch.tensor([0, 1]), layers=[4, 1])
+    assert keys == [4, 1]
+    assert torch.equal(
+        stack[0], dictionary_vectors(W_U.float(), gamma.float(), J[4].float(),
+                                     torch.tensor([0, 1]))
+    )
+
+
+def test_gamma_correction_changes_the_stack():
+    """The regression guard: `correct=False` must not silently equal `correct=True`.
+
+    This is the failure that produces plausible wrong results rather than an error --
+    correctly-chosen tokens with wrongly-constructed directions.
+    """
+    W_U, gamma, J = _toy()
+    ids = torch.arange(10)
+    corrected, _ = dictionary_stack(W_U, gamma, J, ids, correct=True)
+    literal, _ = dictionary_stack(W_U, gamma, J, ids, correct=False)
+    assert not torch.allclose(corrected, literal)
+
+
+def test_uniform_gain_is_the_one_case_where_the_two_constructions_agree():
+    """Up to a shared positive scale -- the module docstring's `iff g is uniform`."""
+    W_U, gamma, J = _toy()
+    uniform = torch.full_like(gamma, 2.0)
+    corrected, _ = dictionary_stack(W_U, uniform, J, torch.arange(6), correct=True)
+    literal, _ = dictionary_stack(W_U, uniform, J, torch.arange(6), correct=False)
+    assert torch.allclose(corrected, literal * 2.0, atol=1e-5)
+
+
+def test_accumulates_in_float32_from_fp16_storage():
+    """Published lenses are fp16; the downstream statistics are Gram matrices."""
+    W_U, gamma, J = _toy()
+    half = {layer: mat.half() for layer, mat in J.items()}
+    stack, _ = dictionary_stack(W_U.half(), gamma.half(), half, torch.tensor([1, 2]))
+    assert stack.dtype is torch.float32
+
+
+def test_oversized_stack_is_refused_with_the_arithmetic_shown():
+    """4096 tokens is 0.4 GiB at 0.8B and 26 GiB at 27B -- easy to be an order out."""
+    W_U, gamma, J = _toy(d_model=8, n_layers=5)
+    with pytest.raises(ValueError, match="GiB"):
+        dictionary_stack(W_U, gamma, J, torch.arange(64), max_gib=1e-9)
+
+
+def test_missing_layer_names_what_is_available():
+    W_U, gamma, J = _toy(n_layers=3)
+    with pytest.raises(ValueError, match="no Jacobian for layer 9"):
+        dictionary_stack(W_U, gamma, J, torch.tensor([0]), layers=[9])
