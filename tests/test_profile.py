@@ -213,41 +213,9 @@ def test_compile_flag_can_be_flipped_without_touching_the_gate_reference(tmp_pat
 
 
 def _add_model_profile():
-    """Import the driver with a stubbed config, restoring sys.path.
+    from conftest import load_driver
 
-    Same pattern as tests/test_compile_soak.py: the driver calls jx_config.load() at
-    import, which raises off-box, and it puts harness/ on sys.path -- which would leak
-    and trip test_scaffold's assertion that harness/ is never importable.
-    """
-    import importlib.util
-    import sys
-    import types
-    from pathlib import Path as _Path
-
-    repo = _Path(__file__).resolve().parent.parent
-    stub = types.ModuleType("jlens_extensions.config")
-
-    class _Cfg:
-        machine = "test-box"
-        artifact_root = _Path("/tmp/does-not-exist")
-
-        def hf_env(self):
-            return {}
-
-    stub.load = lambda: _Cfg()
-    stub.ConfigError = RuntimeError
-    sys.modules["jlens_extensions.config"] = stub
-    saved_path = list(sys.path)
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "_add_model_profile", repo / "experiments" / "add_model_profile.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path[:] = saved_path
-        del sys.modules["jlens_extensions.config"]
+    return load_driver("add_model_profile")
 
 
 def test_set_compile_does_not_demand_the_projection_arguments():

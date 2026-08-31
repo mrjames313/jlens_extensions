@@ -10,54 +10,13 @@ The values are the measured ones from f-2026-08-28-compile-miscompilation.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import pytest
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
 
 
 def load_driver():
-    """Import the driver without running its module-level config load.
+    from conftest import load_driver as _load
 
-    `experiments/` is deliberately not packaged (see experiments/README.md), and the
-    driver calls `jx_config.load()` at import, which raises when JLENS_* is unset --
-    i.e. on any machine that is not the box. Stubbing the config module is what lets
-    the pure reporting logic be tested off-box at all.
-    """
-    import types
-
-    stub = types.ModuleType("jlens_extensions.config")
-
-    class _Cfg:
-        machine = "test-box"
-        artifact_root = Path("/tmp/does-not-exist")
-
-        def hf_env(self):
-            return {}
-
-    stub.load = lambda: _Cfg()
-    stub.ConfigError = RuntimeError
-    sys.modules["jlens_extensions.config"] = stub
-
-    # The driver puts `harness/` on sys.path at import, exactly as fit_lens.py needs.
-    # Executing it here would leave that entry behind for the rest of the session,
-    # which makes `jlens` importable and trips test_scaffold's assertion that
-    # harness/ is never installed. Snapshot and restore rather than leak.
-    saved_path = list(sys.path)
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "_compile_soak", REPO / "experiments" / "compile_soak.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path[:] = saved_path
-        del sys.modules["jlens_extensions.config"]
+    return _load("compile_soak")
 
 
 soak = load_driver()
