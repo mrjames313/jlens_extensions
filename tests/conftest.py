@@ -51,11 +51,17 @@ def load_driver(name: str):
 
     sys.modules["jlens_extensions.config"] = stub
     package.config = stub
+    driver_name = f"_driver_{name}"
     try:
         spec = importlib.util.spec_from_file_location(
-            f"_driver_{name}", REPO / "experiments" / f"{name}.py"
+            driver_name, REPO / "experiments" / f"{name}.py"
         )
         module = importlib.util.module_from_spec(spec)
+        # Register before exec: @dataclass resolves its own module through
+        # sys.modules[cls.__module__] to build __eq__/__repr__, and an unregistered
+        # name makes that None. A driver defining a dataclass fails at import
+        # otherwise, with an error that points at dataclasses.py rather than here.
+        sys.modules[driver_name] = module
         spec.loader.exec_module(module)
         return module
     finally:

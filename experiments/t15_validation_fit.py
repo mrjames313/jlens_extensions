@@ -1,7 +1,15 @@
-"""T15 -- the pinned validation fit, run twice.
+"""The pinned validation fit.
 
-Spec: ``environment-setup-and-first-fit``, stage 4. Produces the lens T16 compares
-against Neuronpedia's published artifact.
+Spec: ``environment-setup-and-first-fit`` stage 4 (T15, Qwen3.5-0.8B, run twice), and
+``workspace-band-location`` T16 (Qwen3.5-4B, run once). Produces the lens the Regime A
+comparison scores against Neuronpedia's published artifact.
+
+**Per model, and ``--n_prompts`` is read rather than typed.** The pin is the published
+``results.prompts_fitted`` for the rung being fitted -- 233 at 0.8B, 417 at 4B -- and it
+comes out of the downloaded artifact's own ``config.yaml``. A hardcoded count is not a
+shortcut but a wrong fit: it completes, saves a plausible lens, and is then compared
+against an artifact fitted on a different number of prompts, with nothing downstream to
+say so. See :func:`published_prompts_fitted`.
 
 Why twice
 ---------
@@ -98,6 +106,8 @@ sys.path.insert(0, str(REPO / "harness"))
 sys.path.insert(0, str(REPO / "src"))
 
 import os  # noqa: E402
+import re  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 
 from jlens_extensions import config as jx_config  # noqa: E402
 from jlens_extensions import provenance as jx_prov  # noqa: E402
@@ -106,9 +116,7 @@ from jlens_extensions.profile import MachineProfile  # noqa: E402
 cfg = jx_config.load()
 os.environ.update(cfg.hf_env())
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
-SLUG = "Qwen3.5-0.8B"          # fit_lens._slug(MODEL_ID); the published stem
-N_PROMPTS = 233                # T1: results.prompts_fitted, read off the artifact
+DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
 DTYPE = "bfloat16"
 DEVICE_MAP = "cuda"
@@ -123,23 +131,90 @@ MAX_CHARS = 2000
 FIT_LENS = REPO / "harness" / "fit_lens.py"
 
 
-def load_corpus() -> tuple[list[str], dict]:
+@dataclass(frozen=True)
+class FitTarget:
+    """What differs between rungs. Resolved once, then threaded rather than global."""
+
+    model_id: str
+    slug: str            # fit_lens._slug(model_id); the published artifact stem
+    n_prompts: int       # the published results.prompts_fitted, READ not typed
+    task: str            # which spec task this run belongs to, for the sidecar
+
+    @property
+    def is_default_rung(self) -> bool:
+        return self.model_id == DEFAULT_MODEL
+
+
+def published_prompts_fitted(model_id: str) -> int:
+    """``results.prompts_fitted`` read from the downloaded artifact's config.yaml.
+
+    **Not a constant, deliberately.** Pinning ``--n_prompts`` to the published count is
+    what makes A1 a like-for-like comparison, and the count differs per rung -- 233 at
+    0.8B, 417 at 4B. A hardcoded value is therefore not a shortcut but a wrong fit: it
+    would run to completion, save a plausible lens, and be compared against an artifact
+    fitted on a different number of prompts. Reading it from the artifact we are
+    comparing against makes the two impossible to disagree.
+
+    Parsed with a regex rather than a YAML loader on purpose: PyYAML is not in our
+    dependency list, and ``PROVENANCE.md`` asserts that list is verbatim from
+    Neuronpedia's. One integer off a flat scalar does not justify falsifying that.
+    """
+    from jlens_extensions.fetch import REGISTRY, destination
+
+    matches = [lens for lens in REGISTRY.values() if lens.hf_model == model_id]
+    if not matches:
+        raise SystemExit(
+            f"no published lens registered for {model_id}; known: "
+            f"{sorted(l.hf_model for l in REGISTRY.values())}. Add it to fetch.py's "
+            f"REGISTRY -- the pin has to come from a published artifact."
+        )
+    config_path = destination(matches[0], cfg) / "config.yaml"
+    if not config_path.exists():
+        raise SystemExit(
+            f"no published config at {config_path}. The fit pins --n_prompts to the "
+            f"published results.prompts_fitted, so the artifact must be downloaded "
+            f"first:\n"
+            f"    uv run python -m jlens_extensions.fetch --model {matches[0].model}"
+        )
+    found = re.search(r"^\s*prompts_fitted:\s*(\d+)\s*$",
+                      config_path.read_text(), re.MULTILINE)
+    if not found:
+        raise SystemExit(
+            f"{config_path} has no results.prompts_fitted line. Do not substitute a "
+            f"default -- the pin is the comparison."
+        )
+    return int(found.group(1))
+
+
+def resolve_target(model_id: str, task: str) -> FitTarget:
+    from fit_lens import _slug
+
+    return FitTarget(
+        model_id=model_id,
+        slug=_slug(model_id),
+        n_prompts=published_prompts_fitted(model_id),
+        task=task,
+    )
+
+
+def load_corpus(target: FitTarget) -> tuple[list[str], dict]:
     """Load the pinned corpus and fingerprint it, before spending an hour on a fit.
 
     ``load_prompts`` is deterministic and streams from the Hub, so both runs see the
-    same 233 prompts and this call sees them too. Fingerprinting here rather than
+    same prompts and this call sees them too. Fingerprinting here rather than
     after the fit means a corpus that has shifted under us fails in seconds.
     """
     from fit_lens import load_prompts
 
-    print(f"loading {N_PROMPTS} prompts from {DATASET} ({DATASET_CONFIG}) ...", flush=True)
+    print(f"loading {target.n_prompts} prompts from {DATASET} ({DATASET_CONFIG}) ...",
+          flush=True)
     prompts = load_prompts(
         dataset=DATASET, config=DATASET_CONFIG, split=DATASET_SPLIT,
-        text_field=TEXT_FIELD, n_prompts=N_PROMPTS, max_chars=MAX_CHARS,
+        text_field=TEXT_FIELD, n_prompts=target.n_prompts, max_chars=MAX_CHARS,
     )
-    if len(prompts) != N_PROMPTS:
+    if len(prompts) != target.n_prompts:
         raise SystemExit(
-            f"corpus returned {len(prompts)} prompts, not {N_PROMPTS}. Pinning "
+            f"corpus returned {len(prompts)} prompts, not {target.n_prompts}. Pinning "
             f"--n_prompts to the published count only reproduces the published fit if "
             f"the stream still yields that many. Do not fit against a short corpus -- "
             f"investigate the dataset revision first."
@@ -150,8 +225,8 @@ def load_corpus() -> tuple[list[str], dict]:
     return prompts, fingerprint
 
 
-def build_command(out_dir: Path, dim_batch: int, compile_model: bool,
-                  gate_identity) -> list[str]:
+def build_command(target: FitTarget, out_dir: Path, dim_batch: int,
+                  compile_model: bool, gate_identity) -> list[str]:
     """The published recipe minus early stopping, via the shared builder.
 
     Built by ``jlens_extensions.fitcmd`` rather than assembled here, because the gate
@@ -162,8 +237,8 @@ def build_command(out_dir: Path, dim_batch: int, compile_model: bool,
     from jlens_extensions.fitcmd import build_fit_command
 
     return build_fit_command(
-        fit_lens_path=FIT_LENS, model_id=MODEL_ID, out_dir=out_dir,
-        n_prompts=N_PROMPTS, dim_batch=dim_batch, max_seq_len=MAX_SEQ_LEN,
+        fit_lens_path=FIT_LENS, model_id=target.model_id, out_dir=out_dir,
+        n_prompts=target.n_prompts, dim_batch=dim_batch, max_seq_len=MAX_SEQ_LEN,
         dtype=DTYPE, device_map=DEVICE_MAP, save_dtype=SAVE_DTYPE,
         dataset=DATASET, dataset_config=DATASET_CONFIG, dataset_split=DATASET_SPLIT,
         text_field=TEXT_FIELD, max_chars=MAX_CHARS,
@@ -203,9 +278,10 @@ def read_trace(csv_path: Path) -> dict:
     }
 
 
-def prepare_out_dir(out_dir: Path, label: str, resume: bool, fresh: bool) -> None:
-    lens = out_dir / f"{SLUG}_jacobian_lens.pt"
-    checkpoint = out_dir / f"{SLUG}_checkpoint.pt"
+def prepare_out_dir(out_dir: Path, target: FitTarget, label: str, resume: bool,
+                    fresh: bool) -> None:
+    lens = out_dir / f"{target.slug}_jacobian_lens.pt"
+    checkpoint = out_dir / f"{target.slug}_checkpoint.pt"
     existing = [p for p in (lens, checkpoint) if p.exists()]
     if not existing:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -229,16 +305,20 @@ def prepare_out_dir(out_dir: Path, label: str, resume: bool, fresh: bool) -> Non
     )
 
 
-def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool,
-            gate_identity=None) -> dict:
-    out_dir = cfg.scratch_root / "fits" / f"t15-{label}"
-    dest = cfg.lenses / f"t15-{label}"
-    prepare_out_dir(out_dir, label, resume, fresh)
+def run_one(target: FitTarget, label: str, facts, corpus_fp: dict, resume: bool,
+            fresh: bool, gate_identity=None, n_runs: int = 1) -> dict:
+    # The default rung keeps the original unqualified name so the validated 0.8B
+    # artifacts at t15-a / t15-b stay addressable and --resume still finds them. Every
+    # other model is qualified, so a second rung cannot write into the first's directory.
+    stem = f"t15-{label}" if target.is_default_rung else f"t15-{target.slug}-{label}"
+    out_dir = cfg.scratch_root / "fits" / stem
+    dest = cfg.lenses / stem
+    prepare_out_dir(out_dir, target, label, resume, fresh)
 
-    cmd = build_command(out_dir, facts.dim_batch, facts.compile, gate_identity)
+    cmd = build_command(target, out_dir, facts.dim_batch, facts.compile, gate_identity)
     print(f"\n=== run {label} ===")
     print("  " + " ".join(cmd), flush=True)
-    projected_h = facts.s_per_prompt * N_PROMPTS / 3600.0
+    projected_h = facts.s_per_prompt * target.n_prompts / 3600.0
     print(f"  profile projects {facts.s_per_prompt:.2f} s/prompt -> {projected_h:.2f}h", flush=True)
 
     started = time.time()
@@ -247,31 +327,33 @@ def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool,
     if proc.returncode != 0:
         raise SystemExit(f"run {label}: fit_lens.py exited {proc.returncode} after {wall_s:.0f}s")
 
-    lens_path = out_dir / f"{SLUG}_jacobian_lens.pt"
-    csv_path = out_dir / f"{SLUG}_convergence.csv"
+    lens_path = out_dir / f"{target.slug}_jacobian_lens.pt"
+    csv_path = out_dir / f"{target.slug}_convergence.csv"
     for path in (lens_path, csv_path):
         if not path.exists():
             raise SystemExit(f"run {label}: expected {path} and it is not there")
 
     trace = read_trace(csv_path)
-    if trace["rows"] != N_PROMPTS:
-        print(f"  WARNING: trace has {trace['rows']} rows, expected {N_PROMPTS}", flush=True)
+    if trace["rows"] != target.n_prompts:
+        print(f"  WARNING: trace has {trace['rows']} rows, expected {target.n_prompts}",
+              flush=True)
     if trace["prompts_skipped"]:
         print(f"  WARNING: {trace['prompts_skipped']} row(s) have n_done != prompt_idx+1 -- "
-              f"a prompt was dropped, so this is not the published 233", flush=True)
+              f"a prompt was dropped, so this is not the published "
+              f"{target.n_prompts}", flush=True)
 
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy2(lens_path, dest / lens_path.name)
     shutil.copy2(csv_path, dest / csv_path.name)
 
     sidecar = jx_prov.build_sidecar(
-        task="T15",
+        task=target.task,
         run=label,
         machine=cfg.machine,
-        model_id=MODEL_ID,
+        model_id=target.model_id,
         command=cmd,
         fit_config={
-            "n_prompts": N_PROMPTS, "dim_batch": facts.dim_batch,
+            "n_prompts": target.n_prompts, "dim_batch": facts.dim_batch,
             "max_seq_len": MAX_SEQ_LEN, "dtype": DTYPE, "device_map": DEVICE_MAP,
             "compile": facts.compile, "save_dtype": SAVE_DTYPE,
             "target_layer": None, "early_stopping": False,
@@ -296,12 +378,16 @@ def run_one(label: str, facts, corpus_fp: dict, resume: bool, fresh: bool,
         },
         results={"wall_clock_s": round(wall_s, 1), **trace},
         notes=(
-            "One of two independent fits at the production configuration. The pair "
-            "measures the run-to-run envelope at compiled dim_batch=8, which T18's "
-            "uncompiled measurement does not transfer to."
+            "One of two independent fits at the production configuration; the pair "
+            "measures the run-to-run envelope at the compiled config."
+            if n_runs > 1 else
+            "A single fit. The run-to-run envelope for this rung comes from the "
+            "single-prompt instrument (f-2026-08-30-single-prompt-envelope-instrument) "
+            "rather than a second fit, per workspace-band-location plan decision 4."
         ),
     )
-    sidecar_path = jx_prov.write_sidecar(dest / f"{SLUG}_provenance.json", sidecar)
+    sidecar_path = jx_prov.write_sidecar(
+        dest / f"{target.slug}_provenance.json", sidecar)
 
     print(f"  done in {wall_s / 3600:.2f}h ({wall_s / max(1, trace['rows']):.2f} s/prompt "
           f"wall, {trace['median_s_per_prompt']:.2f} s/prompt median in-loop)")
@@ -335,8 +421,14 @@ def resolve_gate(facts):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--task", default="T15",
+                        help="which spec task this run belongs to; recorded in the "
+                             "sidecar (workspace-band-location's 4B fit is T16)")
     parser.add_argument("--runs", default="a,b",
-                        help="comma-separated run labels, fitted in order (default: a,b)")
+                        help="comma-separated run labels, fitted in order (default: a,b). "
+                             "Two gives a run-to-run envelope; one is right where the "
+                             "envelope comes from the single-prompt instrument instead")
     parser.add_argument("--resume", action="store_true",
                         help="allow an existing checkpoint to be resumed")
     parser.add_argument("--fresh", action="store_true",
@@ -352,23 +444,27 @@ def main() -> None:
     if not labels:
         raise SystemExit("--runs named no runs")
 
+    target = resolve_target(args.model, args.task)
     profile = MachineProfile.load(cfg.profile_path)
-    facts = profile.model(MODEL_ID)
-    print(f"machine={cfg.machine}  model={MODEL_ID}  runs={labels}")
+    facts = profile.model(target.model_id)
+    print(f"machine={cfg.machine}  model={target.model_id}  runs={labels}  "
+          f"task={target.task}")
     print(f"profile={cfg.profile_path}")
     print(f"  dim_batch={facts.dim_batch} ({facts.dim_batch_basis})  compile={facts.compile}  "
           f"s_per_prompt={facts.s_per_prompt}")
-    print(f"pinned: n_prompts={N_PROMPTS}, max_seq_len={MAX_SEQ_LEN}, dtype={DTYPE}, "
-          f"save_dtype={SAVE_DTYPE}, early stopping OFF")
+    print(f"pinned: n_prompts={target.n_prompts} (read from the published artifact), "
+          f"max_seq_len={MAX_SEQ_LEN}, dtype={DTYPE}, save_dtype={SAVE_DTYPE}, "
+          f"early stopping OFF")
 
-    _, corpus_fp = load_corpus()
+    _, corpus_fp = load_corpus(target)
 
     from jlens_extensions.fitcmd import UNGATED
     gate_identity = UNGATED if args.ungated else resolve_gate(facts)
-    results = [run_one(label, facts, corpus_fp, args.resume, args.fresh, gate_identity)
+    results = [run_one(target, label, facts, corpus_fp, args.resume, args.fresh,
+                       gate_identity, n_runs=len(labels))
                for label in labels]
 
-    print("\n--- T15 summary ---")
+    print(f"\n--- {target.task} summary ---")
     header = f"{'run':>4} {'rows':>5} {'wall_h':>7} {'s/prompt':>9} {'identity_distance':>18} {'mean_rel_change':>16}"
     print(header)
     print("-" * len(header))
@@ -379,10 +475,12 @@ def main() -> None:
 
     out_dir = cfg.artifact_root / "measurements" / "t15"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "t15_validation_fit.json"
+    stem = "t15_validation_fit" if target.is_default_rung \
+        else f"t15_validation_fit_{target.slug}"
+    out_path = out_dir / f"{stem}.json"
     out_path.write_text(json.dumps(
-        {"task": "T15", "machine": cfg.machine, "model": MODEL_ID,
-         "n_prompts": N_PROMPTS, "save_dtype": SAVE_DTYPE,
+        {"task": target.task, "machine": cfg.machine, "model": target.model_id,
+         "n_prompts": target.n_prompts, "save_dtype": SAVE_DTYPE,
          "corpus": corpus_fp, "runs": results}, indent=2) + "\n")
     print(f"\nwrote {out_path}")
     if len(results) > 1:
