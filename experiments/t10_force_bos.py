@@ -31,6 +31,7 @@ Run::
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -52,7 +53,17 @@ import jlens  # noqa: E402
 
 from fit_lens import load_prompts  # noqa: E402
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
+DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
+
+#: Whether ``force_bos`` fires is a *tokenizer* property, so this is per model and
+#: results must not overwrite each other -- see d-2026-08-26-machine-profile-schema.
+#: 0.8B additionally keeps writing the legacy flat filename so t13, which reads it by
+#: that name, is unaffected.
+LEGACY_FILENAME = "t10_force_bos.json"
+
+
+def slug(model_id: str) -> str:
+    return model_id.replace("/", "_")
 MAX_SEQ_LEN = 128
 SAMPLE = "The quick brown fox jumps over the lazy dog."
 
@@ -68,7 +79,14 @@ def describe(tokenizer) -> dict:
 
 
 def main() -> None:
-    print(f"machine={cfg.machine}")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    args = parser.parse_args()
+    MODEL_ID = args.model
+
+    print(f"machine={cfg.machine}  model={MODEL_ID}")
     print(f"loading {MODEL_ID} ...", flush=True)
     hf_model = transformers.AutoModelForCausalLM.from_pretrained(
         MODEL_ID, torch_dtype=torch.bfloat16
@@ -159,9 +177,14 @@ def main() -> None:
     }
     out_dir = cfg.artifact_root / "measurements" / "t10"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "t10_force_bos.json"
-    out_path.write_text(json.dumps(result, indent=2, default=str))
+    payload = json.dumps(result, indent=2, default=str)
+    out_path = out_dir / f"t10_force_bos_{slug(MODEL_ID)}.json"
+    out_path.write_text(payload)
     print(f"\nwrote {out_path}")
+    if MODEL_ID == DEFAULT_MODEL:
+        legacy = out_dir / LEGACY_FILENAME
+        legacy.write_text(payload)
+        print(f"wrote {legacy} (legacy name, read by t13_write_profile.py)")
 
 
 if __name__ == "__main__":

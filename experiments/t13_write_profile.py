@@ -78,7 +78,13 @@ def fit_line(points: list[tuple[float, float]]) -> tuple[float, float]:
 
 
 def main() -> None:
-    t10 = read_measurement("t10", "t10_force_bos.json")
+    # T10 now writes a per-model filename (force_bos is a tokenizer property), and
+    # keeps the flat name for 0.8B so this call site stays correct. Prefer the
+    # per-model file; fall back for profiles written before that change.
+    try:
+        t10 = read_measurement("t10", "t10_force_bos_Qwen_Qwen3.5-0.8B.json")
+    except SystemExit:
+        t10 = read_measurement("t10", "t10_force_bos.json")
     t11 = read_measurement("t11", "t11_dim_batch_sweep.json")
 
     best = t11.get("best_compiled")

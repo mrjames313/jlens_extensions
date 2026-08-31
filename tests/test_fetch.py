@@ -197,3 +197,42 @@ def test_sha256_of_streams_correctly(tmp_path):
     path.write_bytes(PAYLOAD)
 
     assert sha256_of(path) == hashlib.sha256(PAYLOAD).hexdigest()
+
+
+# --- the 4B entry, added by workspace-band-location T14 ----------------------
+
+
+def test_registry_carries_both_published_rungs():
+    from jlens_extensions.fetch import REGISTRY
+
+    assert set(REGISTRY) == {"qwen3.5-0.8b", "qwen3.5-4b"}
+
+
+def test_4b_entry_has_an_independently_recorded_hash_for_the_tensor():
+    """The .pt must carry a sha256 or the integrity check silently degrades.
+
+    `fetch.py` verifies against a hash recorded independently of the download (the
+    Hub's LFS oid). A RemoteFile with size but no sha256 still downloads, and still
+    reports `verified=False` -- which is correct for the small inline files and would
+    be a quiet loss of checking on the 406 MB tensor.
+    """
+    from jlens_extensions.fetch import QWEN35_4B
+
+    tensor = next(f for f in QWEN35_4B.files if f.name.endswith(".pt"))
+    assert tensor.sha256 and len(tensor.sha256) == 64
+    assert tensor.size == 406_333_179
+
+
+def test_4b_fetches_the_early_stopped_lens_not_the_n1000_variant():
+    """Regime A compares against the artifact `config.yaml`'s results block describes.
+
+    That is `prompts_fitted: 417`, i.e. the default file. The repo also publishes
+    `_n1000.pt` (the un-early-stopped run), which has no results block of its own and
+    no 0.8B counterpart; fetching it instead would break the analogy with the lens we
+    already validated at 0.8B.
+    """
+    from jlens_extensions.fetch import QWEN35_4B
+
+    names = [f.name for f in QWEN35_4B.files]
+    assert "Qwen3.5-4B_jacobian_lens.pt" in names
+    assert not any("n1000" in n for n in names)

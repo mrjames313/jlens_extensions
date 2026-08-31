@@ -83,7 +83,39 @@ QWEN35_08B = PublishedLens(
     ),
 )
 
-REGISTRY: dict[str, PublishedLens] = {QWEN35_08B.model: QWEN35_08B}
+#: Sizes and LFS oids read from the Hub tree API on 2026-08-30, independently of any
+#: download, as the module docstring requires.
+#:
+#: **This repo publishes two 4B lenses and only one 0.8B one.** Alongside the file
+#: below there is a ``Qwen3.5-4B_jacobian_lens_n1000.pt`` (406,332,644 bytes, sha256
+#: ``1f9a8f8fd593f0ffec1a9640993257ca4560f8ae3e5602315643d5cc6818534e``). Both fits
+#: were launched with ``--n_prompts 1000 --stop_at_delta 0.002``; early stopping fired
+#: at 417, and the ``_n1000`` file is the un-early-stopped full run. The **default**
+#: file is the one ``config.yaml``'s ``results`` block describes, so it is the one
+#: ``prompts_fitted`` refers to and the direct analogue of what we validated against at
+#: 0.8B. It is therefore the Regime A reference here; the ``_n1000`` variant is
+#: deliberately not fetched. Recorded rather than silently omitted, because "there is a
+#: second lens" is exactly the thing a later reader would otherwise rediscover the hard
+#: way.
+QWEN35_4B = PublishedLens(
+    model="qwen3.5-4b",
+    hf_model="Qwen/Qwen3.5-4B",
+    path="qwen3.5-4b/jlens/Salesforce-wikitext",
+    files=(
+        RemoteFile(
+            "Qwen3.5-4B_jacobian_lens.pt",
+            size=406_333_179,
+            sha256="c2e20eb414caf67da4c271fb9be52c5b84cb0af5c3c42ff93b88b55f7e67b154",
+        ),
+        RemoteFile("Qwen3.5-4B_convergence.csv", size=17_796),
+        RemoteFile("config.yaml", size=2_511),
+    ),
+)
+
+REGISTRY: dict[str, PublishedLens] = {
+    QWEN35_08B.model: QWEN35_08B,
+    QWEN35_4B.model: QWEN35_4B,
+}
 
 
 @dataclass(frozen=True)
