@@ -86,10 +86,28 @@ def main() -> None:
     compile_group.add_argument("--compile", dest="compile", action="store_true")
     compile_group.add_argument("--no-compile", dest="compile", action="store_false")
     parser.add_argument("--force", action="store_true",
-                        help="overwrite an existing entry for this model")
+                        help="overwrite an existing entry, preserving its measured fields")
+    parser.add_argument(
+        "--set-compile", action="store_true",
+        help="update ONLY the compile flag on an existing entry and exit; the normal "
+             "way to record a compile-soak verdict without disturbing anything measured",
+    )
     args = parser.parse_args()
 
     profile = MachineProfile.load(cfg.profile_path)
+
+    # The soak verdict arrives after the entry exists and after gate_identity has been
+    # measured, so the common update is one boolean. Rebuilding the whole entry to
+    # change it would discard the gate reference -- see the preservation below.
+    if args.set_compile:
+        facts = profile.model(args.model)
+        was, facts.compile = facts.compile, args.compile
+        profile.updated = date.today().isoformat()
+        profile.write(cfg.profile_path)
+        print(f"{args.model}: compile {was} -> {facts.compile} in {cfg.profile_path}")
+        print(f"  gate_identity {facts.gate_identity} preserved")
+        return
+
     if args.model in profile.models and not args.force:
         raise SystemExit(
             f"{cfg.profile_path} already has an entry for {args.model}. Pass --force to "
@@ -97,6 +115,12 @@ def main() -> None:
             f"projections is a downgrade."
         )
 
+    # Carry forward what was *measured* rather than rebuilding it as None. Replacing an
+    # entry to change a projected field would otherwise discard the gate reference,
+    # which costs 15-20 minutes of GPU time at 4B and whose absence makes
+    # t15_validation_fit.py refuse a compiled fit -- a silent loss, since ModelFacts
+    # defaults it to None and nothing would complain until the fit was attempted.
+    previous = profile.models.get(args.model)
     force_bos = read_force_bos(args.model)
     profile.models[args.model] = ModelFacts(
         dim_batch=args.dim_batch,
@@ -115,6 +139,11 @@ def main() -> None:
             f"for that reason. The fit replaces them with measured values."
         ),
     )
+    if previous is not None and previous.gate_identity is not None:
+        facts = profile.models[args.model]
+        facts.gate_identity = previous.gate_identity
+        facts.gate_identity_basis = previous.gate_identity_basis
+        print(f"  preserved gate_identity {facts.gate_identity:.6f} from the old entry")
     profile.updated = date.today().isoformat()
     profile.write(cfg.profile_path)
 

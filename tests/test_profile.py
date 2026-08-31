@@ -168,3 +168,42 @@ def test_dim_batch_basis_distinguishes_optimum_from_ceiling(tmp_path):
     assert entry.dim_batch == 8
     assert entry.dim_batch_ceiling_measured == 64
     assert entry.dim_batch != entry.dim_batch_ceiling_measured
+
+
+# --- add_model_profile's preservation of measured fields (band-location T15) ---
+
+
+def test_replacing_an_entry_must_not_silently_drop_gate_identity():
+    """ModelFacts defaults gate_identity to None, so a rebuild loses it quietly.
+
+    That is 15-20 minutes of GPU time at 4B, and its absence makes
+    t15_validation_fit.py refuse a compiled fit -- but nothing complains until the fit
+    is attempted, long after the entry was rewritten. This asserts the field's default
+    is the trap it looks like, so the preservation in add_model_profile.py has a
+    reason recorded next to it.
+    """
+    fresh = facts()
+    assert fresh.gate_identity is None, (
+        "if this ever gains a non-None default, add_model_profile.py's preservation "
+        "logic should be revisited"
+    )
+
+
+def test_compile_flag_can_be_flipped_without_touching_the_gate_reference(tmp_path):
+    """The soak verdict arrives as one boolean, after gate_identity is measured."""
+    profile = MachineProfile(
+        machine="test-box", updated="2026-08-31",
+        host=host(),
+        models={"M": facts(compile=False, gate_identity=0.522718)},
+    )
+    path = profile.write(tmp_path / "p.toml")
+
+    reloaded = MachineProfile.load(path)
+    entry = reloaded.model("M")
+    entry.compile = True
+    reloaded.write(path)
+
+    after = MachineProfile.load(path).model("M")
+    assert after.compile is True
+    assert after.gate_identity == 0.522718
+    assert after.gate_identity_basis == "uncompiled single prompt"
