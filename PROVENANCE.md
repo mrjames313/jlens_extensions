@@ -140,6 +140,46 @@ published `prompts_fitted` and the early-stopping rule are *defined* by their
 `mean_rel_change`, and upstream's same-named statistic computes something different.
 Porting it would break the comparability the vendored copy was chosen for.
 
+## The vendored prompt and evaluation data (`data/`)
+
+A second, independent vendoring — different upstream, different reason. `harness/` is a
+fork of Neuronpedia's *code*; `data/` is a byte-identical copy of Anthropic's *prompt
+material*, and nothing in it is modified.
+
+| | |
+|---|---|
+| Source repo | `https://github.com/anthropics/jacobian-lens` |
+| Source commit | `581d398` — "Initial release", 2026-07-02 |
+| Source path | `data/` |
+| Copied | 2026-08-30 |
+| Contents | 17 JSON files (11 `experiments/`, 6 `evaluations/`) plus both READMEs — 272 KB |
+| Licence | Apache-2.0 — licence text copied to `data/LICENSE`, as §4(a) requires |
+
+`581d398` is the same revision the four `harness/` backports came from, so the two
+vendorings are consistent with each other.
+
+**Why copied rather than read from the reference checkout.** Those checkouts are
+gitignored and per-clone under `d-commons-reference-checkouts`, which is right for code
+we only read and wrong for data a *result* depends on: an experiment citing
+`ignition.json` from a per-clone checkout cannot be re-run from a fresh clone without
+re-cloning upstream at an unpinned revision. The decision page
+`d-2026-08-30-vendor-upstream-data` carries the full argument, including why this does
+not contradict the commons decision.
+
+**The READMEs are data, not documentation.** They carry the protocol each prompt set is
+scored under — which field is the target, what counts as a hit, how the readout is
+defined. `ignition.json` is 4 KB of word lists and is close to meaningless without
+`data/experiments/README.md`. Both are vendored for that reason, and
+`upstream_data.readme()` exists so a driver author reaches them without having to know
+to go looking.
+
+**Access is through `src/jlens_extensions/upstream_data.py` only.** Nothing should read
+`reference/` at runtime; the loader raises rather than falling back to it, since a
+silent fallback would reintroduce the hole on the one machine that happens to have the
+checkout. `tests/test_upstream_data.py` asserts the vendored path itself rather than
+just that JSON parses, because a loader quietly reading the checkout would pass the
+weaker test.
+
 ## Deviations from Neuronpedia's dependency set
 
 The seven runtime dependencies above are verbatim. Three deliberate differences in the
