@@ -116,6 +116,37 @@ def draw_mb(model_id: str) -> float:
     """Per-draw size, from the table or extrapolated with a warning."""
     return DRAW_MB.get(model_id, max(DRAW_MB.values()))
 
+
+#: Multiple of the expected per-draw cost allowed before a child is called hung, and
+#: the floor below which the timeout never drops.
+TIMEOUT_FACTOR = 6
+TIMEOUT_FLOOR_S = 600
+
+
+def child_timeout_s(model_id: str, policy: str) -> int:
+    """How long a draw may take before it is treated as hung.
+
+    **Derived, not a constant, and the reason is a real failure.** ``childproc``'s
+    300 s default is a 0.8B-era number: an uncompiled 4B draw is ~317 s, so the gate
+    reference -- the slowest draw type and the first one run -- timed out on every
+    prompt, and the whole measurement produced nothing.
+
+    ``compile_soak.py`` met this first and raised its default to a flat 3600 s, with
+    the argument that matters more than the arithmetic: **a timed-out draw is not a
+    lost draw, it is a biased sample.** Draws are dropped silently, and if slowness
+    correlates with anything -- a compile variant, an unlucky allocation -- the
+    variant grouping this driver reads is skewed by the drops rather than merely
+    thinned.
+
+    A flat 3600 s would be right at 4B and would break again at 27B for exactly the
+    reason 300 s broke here. Scaling off the per-draw cost fixes the class: generous
+    where draws are slow, still prompt enough at 0.8B that a genuine hang does not
+    cost an hour.
+    """
+    cost = COST_S.get(model_id, COST_S[DEFAULT_MODEL])
+    expected = cost.get(policy, max(cost.values()))
+    return max(TIMEOUT_FLOOR_S, TIMEOUT_FACTOR * expected)
+
 #: (compile-layer policy, dim_batch). `none` is uncompiled and single-variant, so it
 #: anchors the configuration comparison; `linear-attn` is production and carries both
 #: the variant question and the dim_batch one.
@@ -227,13 +258,20 @@ def reference_identity(prompt_idx: int, scratch: Path, model_id: str) -> float:
     Uncompiled cannot miscompile, so this draw needs no gate of its own.
     """
     dest = scratch / f"gate-ref-p{prompt_idx}.pt"
+    timeout_s = child_timeout_s(model_id, "none")
     r = run_child(__file__, f"gate-reference-p{prompt_idx}",
                   ["--child", "draw", "--dim-batch", "8", "--compile-layers", "none",
                    "--prompt-index", str(prompt_idx), "--model", model_id,
-                   "--out", str(dest)])
+                   "--out", str(dest)], timeout_s=timeout_s)
     dest.unlink(missing_ok=True)
     if not r:
-        raise SystemExit(f"could not establish a gate reference for prompt {prompt_idx}")
+        raise SystemExit(
+            f"could not establish a gate reference for prompt {prompt_idx} "
+            f"(uncompiled draw, {timeout_s}s limit).\n"
+            f"This is the slowest draw type and the first one run, so it is where a "
+            f"too-short timeout shows up first. If it timed out rather than crashed, "
+            f"raise --timeout-s: the cost table's estimate for {model_id} may be low."
+        )
     return r["identity_distance"]
 
 
@@ -540,6 +578,11 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help=f"HF model id to draw on (default: {DEFAULT_MODEL})")
+    parser.add_argument("--timeout-s", type=int, default=None,
+                        help="per-draw timeout. Default is derived from the model's "
+                             "expected per-draw cost; see child_timeout_s. A timed-out "
+                             "draw is dropped silently, which biases the grouping, so "
+                             "raise this rather than accept drops")
     parser.add_argument("--out-tag", default=None,
                         help="suffix for the output filename, so several runs (e.g. "
                              "one per prompt) do not overwrite each other")
@@ -596,6 +639,11 @@ def main() -> None:
           + ("  (comparisons never cross a prompt)" if len(prompts) > 1 else ""))
     print(f"Arms: {', '.join(f'{p}:{d}x{n}@p{q}' for p, d, n, q in arms)}")
     print(f"Estimated {est_min:.0f} minutes of draws, then a few minutes of analysis.")
+    limits = {p: args.timeout_s or child_timeout_s(args.model, p) for p, _, _, _ in arms}
+    limits["none"] = args.timeout_s or child_timeout_s(args.model, "none")
+    print("Per-draw timeout: "
+          + ", ".join(f"{p} {s}s" for p, s in sorted(limits.items()))
+          + "  (a timed-out draw is dropped, which biases the grouping)")
     per_draw = draw_mb(args.model)
     if args.model not in DRAW_MB:
         print(f"  no per-draw size recorded for {args.model}; using the largest known "
@@ -632,7 +680,9 @@ def main() -> None:
             r = run_child(__file__, tag,
                           ["--child", "draw", "--dim-batch", str(db),
                            "--compile-layers", policy, "--prompt-index", str(prompt_idx),
-                           "--model", args.model, "--out", str(dest)], quiet=True)
+                           "--model", args.model, "--out", str(dest)],
+                          timeout_s=args.timeout_s or child_timeout_s(args.model, policy),
+                          quiet=True)
             if not r:
                 continue
             # Gate before the draw enters any group. A miscompiled Jacobian is not a

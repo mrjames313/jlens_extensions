@@ -109,10 +109,7 @@ def run_prompt(model_id: str, model_slug: str, prompt: int, draws: int) -> Path:
     print("  " + " ".join(cmd), flush=True)
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        print(f"  prompt {prompt} FAILED (exit {result.returncode}); continuing. "
-              f"Steps 8-9 average over whatever prompts succeeded, and the count is "
-              f"recorded -- but see the minimum below.")
-        return dest if dest.exists() else None
+        return None
     return dest
 
 
@@ -191,8 +188,31 @@ def main() -> None:
               f"reference), each in its own process.")
         print(f"Estimated ~{est_h:.1f} h. One offset_profile run per prompt, so the "
               f"analysis never holds more than one prompt's draws at once.")
-        for prompt in prompts:
-            run_prompt(args.model, model_slug, prompt, args.draws)
+        for i, prompt in enumerate(prompts):
+            ok = run_prompt(args.model, model_slug, prompt, args.draws)
+            if ok is not None:
+                continue
+            # A later prompt failing is a prompt-specific problem: every group
+            # screened out, an unlucky run of miscompiles. Carry on and record the
+            # reduced count. The FIRST one failing is almost never prompt-specific --
+            # it is the model, the environment, or a limit that applies equally to
+            # all five -- and running the other four to watch them fail the same way
+            # costs hours and produces nothing. That is exactly what a 300 s child
+            # timeout did against a ~317 s uncompiled 4B draw.
+            if i == 0:
+                raise SystemExit(
+                    f"prompt {prompt} failed, and it is the first one.\n"
+                    f"Nothing here is specific to that prompt, so the remaining "
+                    f"{len(prompts) - 1} would almost certainly fail the same way -- "
+                    f"and each costs ~{(args.draws + 1) * per_draw_min:.0f} min to "
+                    f"find out. Read the offset_profile output above for the cause, "
+                    f"then re-run.\n"
+                    f"If it was a timeout, pass --draws/--prompts through after "
+                    f"raising offset_profile's --timeout-s; the cost estimate for "
+                    f"{args.model} may be low."
+                )
+            print(f"  prompt {prompt} FAILED; continuing. Steps 8-9 average over "
+                  f"whatever prompts succeeded, and the count is recorded.")
 
     print("\n=== steps 8-9: average across prompts, then divide by n**alpha ===")
     noise = collect(model_slug, prompts)

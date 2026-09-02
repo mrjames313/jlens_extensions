@@ -157,3 +157,42 @@ def test_in_range_use_says_so(driver, monkeypatch, tmp_path):
                        f"envelope_{slug}.json").read_text())
     assert blob["alpha_in_range"] is True
     assert "UNDER-predicted" not in blob["caveat"]
+
+
+# --- the timeout that broke the first 4B run --------------------------------
+
+def test_child_timeout_covers_the_slowest_draw_at_every_known_model():
+    """childproc's 300 s default is a 0.8B number and killed every 4B gate reference.
+
+    The gate reference is uncompiled -- the slowest draw type -- and runs first, so a
+    too-short limit takes out the whole measurement before a single gated draw. This
+    asserts the derived limit clears the cost table's own estimate with headroom, at
+    every model in it, which is what stops the same bug arriving again at 27B.
+    """
+    from conftest import load_driver
+
+    offset = load_driver("offset_profile")
+    for model, costs in offset.COST_S.items():
+        for policy, expected_s in costs.items():
+            limit = offset.child_timeout_s(model, policy)
+            assert limit > expected_s, f"{model}/{policy}: {limit}s <= {expected_s}s"
+            assert limit >= offset.TIMEOUT_FACTOR * expected_s or \
+                limit == offset.TIMEOUT_FLOOR_S
+
+
+def test_the_uncompiled_gate_reference_is_the_binding_case():
+    """It is the slowest policy, so its limit must be the largest -- and > 300 s."""
+    from conftest import load_driver
+
+    offset = load_driver("offset_profile")
+    for model in offset.COST_S:
+        limit = offset.child_timeout_s(model, "none")
+        assert limit == max(offset.child_timeout_s(model, p) for p in offset.COST_S[model])
+        assert limit > 300, "the childproc default that broke the first 4B run"
+
+
+def test_an_unknown_model_still_gets_a_usable_limit():
+    from conftest import load_driver
+
+    offset = load_driver("offset_profile")
+    assert offset.child_timeout_s("Qwen/Qwen3.5-27B", "none") >= offset.TIMEOUT_FLOOR_S
