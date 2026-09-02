@@ -87,17 +87,34 @@ from jlens_extensions.childproc import emit_result, run_child  # noqa: E402
 from jlens_extensions.compare import group_offset, rel_frobenius  # noqa: E402
 from jlens_extensions.compile_policy import cluster_variants, identity_in_band  # noqa: E402
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
+DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 MAX_SEQ_LEN = 128
-D_MODEL = 1024
-#: Prompt 0's sound identity_distance on this model. Used only as a fallback and
-#: as a sanity check -- the gate reference is MEASURED per prompt, see
-#: reference_identity(). Different prompts have different Jacobians and therefore
-#: different identity_distance: prompt 1 sits at ~0.5644, 6.2% from this value, so
-#: gating prompt 1 against this constant rejects every sound draw including the
-#: uncompiled ones. That is exactly what the first run of the 18-arm grid did.
-EXPECTED_IDENTITY = 0.5314
 IDENTITY_TOL = 0.01
+
+#: Per-draw cost in seconds, by (model, policy). Compiled arms run at roughly half
+#: the uncompiled rate. Used only for the pre-flight estimate, which is what tells an
+#: unattended run whether it fits the budget *before* it starts rather than after --
+#: so a missing model must not silently inherit 0.8B's numbers and under-quote by 4x.
+COST_S = {
+    "Qwen/Qwen3.5-0.8B": {"all": 47, "linear-attn": 47, "full-attn": 60, "none": 72},
+    # 4B: a compiled draw took 207 s in T15's soak, model load and compiling 24
+    # blocks included. Uncompiled is scaled by 0.8B's 72/47 ratio and is the softer
+    # of the two numbers.
+    "Qwen/Qwen3.5-4B": {"all": 207, "linear-attn": 207, "full-attn": 260, "none": 317},
+}
+
+#: Bytes one draw occupies: ``(n_layers - 1) * d_model**2 * 4`` for fp32 Jacobians.
+#: **This is the constraint that scales worst with model size**, because it grows with
+#: ``d_model`` squared: 96 MB at 0.8B (23 x 1024^2 x 4), 812 MB at 4B (31 x 2560^2 x 4),
+#: an 8.5x jump for a 5x model. The analysis is deliberately eager (see load_tensors),
+#: so the default 32-draw grid holds ~3 GB at 0.8B and ~26 GB at 4B. Worth knowing
+#: before a run rather than when it dies at the analysis step, hours in.
+DRAW_MB = {"Qwen/Qwen3.5-0.8B": 96, "Qwen/Qwen3.5-4B": 812}
+
+
+def draw_mb(model_id: str) -> float:
+    """Per-draw size, from the table or extrapolated with a warning."""
+    return DRAW_MB.get(model_id, max(DRAW_MB.values()))
 
 #: (compile-layer policy, dim_batch). `none` is uncompiled and single-variant, so it
 #: anchors the configuration comparison; `linear-attn` is production and carries both
@@ -152,7 +169,7 @@ def parse_arms(spec: str | None,
 
 
 def child_draw(dim_batch: int, which: str, out_path: Path,
-               prompt_idx: int = 0) -> dict:
+               prompt_idx: int = 0, model_id: str = DEFAULT_MODEL) -> dict:
     """One prompt's Jacobian at one configuration, in this process, saved to disk."""
     import torch
     import transformers
@@ -163,9 +180,9 @@ def child_draw(dim_batch: int, which: str, out_path: Path,
     from fit_lens import load_prompts
 
     hf = transformers.AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16
+        model_id, torch_dtype=torch.bfloat16
     ).cuda()
-    tok = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
+    tok = transformers.AutoTokenizer.from_pretrained(model_id)
     compiled = which != "none"
     model = jlens.from_hf(hf, tok, compile=(which == "all"))
     if compiled and which != "all":
@@ -185,7 +202,12 @@ def child_draw(dim_batch: int, which: str, out_path: Path,
         dim_batch=dim_batch, max_seq_len=MAX_SEQ_LEN,
     )
     late = max(source_layers)
-    ident = (J[late].float() - torch.eye(D_MODEL)).norm().item() / D_MODEL**0.5
+    # d_model off the tensor, not a constant: it is 1024 at 0.8B and 2560 at 4B, and
+    # a wrong value here does not raise -- torch.eye of the wrong size would, but a
+    # wrong sqrt(d) divisor would just rescale identity_distance and silently move
+    # every gate verdict with it.
+    d_model = J[late].shape[-1]
+    ident = (J[late].float() - torch.eye(d_model)).norm().item() / d_model**0.5
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({l: J[l].float() for l in source_layers}, str(out_path))
     return {"dim_batch": dim_batch, "compile_layers": which, "compiled": compiled,
@@ -193,7 +215,7 @@ def child_draw(dim_batch: int, which: str, out_path: Path,
             "n_valid": n_valid, "path": str(out_path)}
 
 
-def reference_identity(prompt_idx: int, scratch: Path) -> float:
+def reference_identity(prompt_idx: int, scratch: Path, model_id: str) -> float:
     """One uncompiled draw, to establish what a sound run looks like on THIS prompt.
 
     `f-2026-08-28-compile-miscompilation` already prescribes this for a model with no
@@ -207,7 +229,8 @@ def reference_identity(prompt_idx: int, scratch: Path) -> float:
     dest = scratch / f"gate-ref-p{prompt_idx}.pt"
     r = run_child(__file__, f"gate-reference-p{prompt_idx}",
                   ["--child", "draw", "--dim-batch", "8", "--compile-layers", "none",
-                   "--prompt-index", str(prompt_idx), "--out", str(dest)])
+                   "--prompt-index", str(prompt_idx), "--model", model_id,
+                   "--out", str(dest)])
     dest.unlink(missing_ok=True)
     if not r:
         raise SystemExit(f"could not establish a gate reference for prompt {prompt_idx}")
@@ -221,14 +244,19 @@ def load_tensors(draws: list[dict]) -> None:
     """Load every draw's Jacobians into memory once, keyed onto the draw.
 
     Deliberately eager. The comparisons are pairwise over every draw in an arm and
-    then across arms, so a load-per-pair would re-read each 96 MB file dozens of
-    times -- around 95 GB of reads at the default arm count, for 3 GB of distinct
-    data. Peak memory is ``n_draws x 96 MB``: ~3 GB for the 32-draw default, which
-    is nothing against this box's 121 GB but is worth knowing before someone passes
-    ``--draws 40``.
+    then across arms, so a load-per-pair would re-read each file dozens of times --
+    around 95 GB of reads at 0.8B's default arm count, for 3 GB of distinct data.
+
+    Peak memory is ``n_draws x`` the per-draw size, and that size grows with
+    ``d_model`` squared: ~96 MB at 0.8B but ~812 MB at 4B, so the same 32-draw grid
+    holds ~3 GB at one rung and ~26 GB at the next. The total is printed before
+    loading, because the failure mode is an out-of-memory kill at the analysis step
+    after every draw has already been paid for.
     """
     import torch
 
+    total = sum(Path(d["path"]).stat().st_size for d in draws if Path(d["path"]).exists())
+    print(f"  loading {len(draws)} draws, {total / 1024**3:.1f} GB", flush=True)
     for d in draws:
         d["tensors"] = torch.load(d["path"], map_location="cpu")
 
@@ -436,8 +464,23 @@ def reanalyse(manifest: Path, screen: bool = False) -> None:
     print(f"\nwrote {dest}")
 
 
-def report(result: dict, layers_shown=(0, 4, 8, 15, 22)) -> None:
+def pick_layers(layers, n=5) -> tuple[int, ...]:
+    """Evenly spaced layers spanning the stack, always including its ends.
+
+    The report used to name (0, 4, 8, 15, 22) literally, which is 0.8B's stack. At 4B
+    that silently drops the top 8 layers from every table -- including L30, where the
+    depth-falloff screen does its work -- and the tables would still look complete.
+    """
+    layers = sorted(layers)
+    if len(layers) <= n:
+        return tuple(layers)
+    idx = [round(i * (len(layers) - 1) / (n - 1)) for i in range(n)]
+    return tuple(sorted({layers[i] for i in idx}))
+
+
+def report(result: dict, layers_shown=None) -> None:
     noise = result["noise_rms"]
+    layers_shown = layers_shown or pick_layers(noise)
     print("\n=== run-to-run noise (same path, different process), per layer ===")
     print("   " + "  ".join(f"L{l}: {noise[l]:.3e}" for l in layers_shown if l in noise))
 
@@ -495,6 +538,11 @@ def report(result: dict, layers_shown=(0, 4, 8, 15, 22)) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"HF model id to draw on (default: {DEFAULT_MODEL})")
+    parser.add_argument("--out-tag", default=None,
+                        help="suffix for the output filename, so several runs (e.g. "
+                             "one per prompt) do not overwrite each other")
     parser.add_argument("--draws", type=int, default=8,
                         help="default draws per arm, when --arms does not give a "
                              "per-arm count (default 8)")
@@ -527,34 +575,47 @@ def main() -> None:
 
     if args.child:
         emit_result(child_draw(args.dim_batch, args.compile_layers, Path(args.out),
-                               args.prompt_index))
+                               args.prompt_index, args.model))
         return
 
     arms = parse_arms(args.arms, args.draws)
     scratch = cfg.scratch_root / "offset-profile"
     out = cfg.artifact_root / "measurements" / "offset-profile"
     out.mkdir(parents=True, exist_ok=True)
-    #: Per-draw cost, seconds, by policy -- compiled arms run at roughly half the
-    #: uncompiled rate, and the estimate is what tells an unattended run whether it
-    #: fits the budget before it starts rather than after.
-    COST_S = {"all": 47, "linear-attn": 47, "full-attn": 60, "none": 72}
+    cost = COST_S.get(args.model)
+    if cost is None:
+        print(f"  no per-draw cost recorded for {args.model}; the time estimate below "
+              f"uses 0.8B's and will be wrong. Add a row to COST_S once measured.")
+        cost = COST_S[DEFAULT_MODEL]
     total_draws = sum(n for _, _, n, _ in arms)
-    est_min = sum(n * COST_S.get(p, 55) for p, _, n, _ in arms) / 60
+    est_min = sum(n * cost.get(p, max(cost.values())) for p, _, n, _ in arms) / 60
     prompts = sorted({q for _, _, _, q in arms})
-    print(f"machine={cfg.machine}  model={MODEL_ID}")
+    print(f"machine={cfg.machine}  model={args.model}")
     print(f"{len(arms)} arms, {total_draws} draws, each in its own process.")
     print(f"Prompts: {prompts}"
           + ("  (comparisons never cross a prompt)" if len(prompts) > 1 else ""))
     print(f"Arms: {', '.join(f'{p}:{d}x{n}@p{q}' for p, d, n, q in arms)}")
     print(f"Estimated {est_min:.0f} minutes of draws, then a few minutes of analysis.")
-    print(f"Analysis holds every draw in memory: ~{total_draws * 96 / 1024:.1f} GB.\n")
+    per_draw = draw_mb(args.model)
+    if args.model not in DRAW_MB:
+        print(f"  no per-draw size recorded for {args.model}; using the largest known "
+              f"({per_draw} MB) so the estimate errs high. Add a row to DRAW_MB.")
+    print(f"Analysis holds every draw in memory: "
+          f"~{total_draws * per_draw / 1024:.1f} GB at {per_draw} MB/draw.\n")
 
     # One uncompiled probe per prompt, before any gated draw on that prompt.
     references: dict[int, float] = {}
     for q in prompts:
-        references[q] = reference_identity(q, scratch)
-        off = abs(references[q] - EXPECTED_IDENTITY) / EXPECTED_IDENTITY
-        note = "" if q == 0 else f"   ({off:.1%} from prompt 0 -- as expected, different prompt)"
+        references[q] = reference_identity(q, scratch, args.model)
+        # The note compares against the FIRST prompt measured in this run, not a
+        # stored constant: identity_distance is a property of the model and the
+        # prompt together, so a constant from another model gates every sound draw
+        # out. Spread across prompts is expected and is the reason the reference is
+        # per prompt at all.
+        first = references[prompts[0]]
+        off = abs(references[q] - first) / first
+        note = "" if q == prompts[0] else \
+            f"   ({off:.1%} from prompt {prompts[0]} -- as expected, different prompt)"
         print(f"  gate reference, prompt {q}: {references[q]:.6f}{note}", flush=True)
 
     draws: list[dict] = []
@@ -571,7 +632,7 @@ def main() -> None:
             r = run_child(__file__, tag,
                           ["--child", "draw", "--dim-batch", str(db),
                            "--compile-layers", policy, "--prompt-index", str(prompt_idx),
-                           "--out", str(dest)], quiet=True)
+                           "--model", args.model, "--out", str(dest)], quiet=True)
             if not r:
                 continue
             # Gate before the draw enters any group. A miscompiled Jacobian is not a
@@ -608,9 +669,10 @@ def main() -> None:
     results = analyse(draws)
     report(results)
 
-    dest = out / "offset_profile.json"
+    stem = "offset_profile" + (f"_{args.out_tag}" if args.out_tag else "")
+    dest = out / f"{stem}.json"
     dest.write_text(json.dumps(
-        {"task": "offset-profile", "machine": cfg.machine, "model": MODEL_ID,
+        {"task": "offset-profile", "machine": cfg.machine, "model": args.model,
          "arms": [list(a) for a in arms],
          "n_sound": len(draws), "n_dropped": dropped,
          "rejected": [{k: v for k, v in d.items() if k != "tensors"}
@@ -632,8 +694,8 @@ def main() -> None:
     else:
         held = sum(1 for d in draws if Path(d["path"]).exists())
         print(f"kept {held} Jacobians under {scratch} "
-              f"(~{held * 96 / 1024:.1f} GB) so the analysis can be redone without "
-              f"re-running the grid; --discard-tensors to drop them")
+              f"(~{held * draw_mb(args.model) / 1024:.1f} GB) so the analysis can be "
+              f"redone without re-running the grid; --discard-tensors to drop them")
 
 
 if __name__ == "__main__":
