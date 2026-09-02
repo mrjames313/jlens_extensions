@@ -196,3 +196,40 @@ def test_an_unknown_model_still_gets_a_usable_limit():
 
     offset = load_driver("offset_profile")
     assert offset.child_timeout_s("Qwen/Qwen3.5-27B", "none") >= offset.TIMEOUT_FLOOR_S
+
+
+# --- the prompt-4 shape: a group that is uniformly wrong --------------------
+
+def test_blind_spot_ratio_separates_the_offsets_actually_measured():
+    """Sound variant offsets sat at 0.95x and 3.3x the noise; 4B/p4 sat at 65x.
+
+    The threshold has to fall in that gap, and this pins it there so a later tweak
+    cannot quietly move it past either the real signal or the real nulls.
+    """
+    from conftest import load_driver
+
+    offset = load_driver("offset_profile")
+    sound_ratios = (0.95, 3.3)          # 4B prompts 0 and 3
+    suspect_ratio = 65.0                # 4B prompt 4
+    assert max(sound_ratios) < offset.BLIND_SPOT_RATIO < suspect_ratio
+
+
+def test_variant_readings_print_enough_digits_to_show_a_split(capsys):
+    """At 6 dp, two variants split in their last bits print the same number.
+
+    That made the 4B prompt-3 and prompt-4 output look like a clustering bug --
+    identical values in two groups -- when grouping is exact and the split is the
+    benign one cluster_variants documents.
+    """
+    from conftest import load_driver
+
+    offset = load_driver("offset_profile")
+    draws = [{"identity_distance": 0.5549601, "compile_layers": "linear-attn",
+              "dim_batch": 8, "prompt_idx": 4},
+             {"identity_distance": 0.5549604, "compile_layers": "linear-attn",
+              "dim_batch": 8, "prompt_idx": 4}]
+    offset.assign_variants(draws)
+    printed = capsys.readouterr().out
+    assert "2 variant(s)" in printed
+    assert "0.5549601" in printed and "0.5549604" in printed, \
+        f"the two readings must be distinguishable on screen; got: {printed.strip()}"

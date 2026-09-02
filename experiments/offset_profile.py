@@ -122,6 +122,13 @@ def draw_mb(model_id: str) -> float:
 TIMEOUT_FACTOR = 6
 TIMEOUT_FLOOR_S = 600
 
+#: How far above the within-group noise a cross-group offset must sit before it is
+#: called out as more likely a missed miscompile than a variant offset. Sound variant
+#: offsets measured to date sit at 0.95x and 3.3x the noise; the 4B prompt-4 group
+#: that prompted this check sat at 65x. Anything in between is worth a second look,
+#: which is what the message asks for rather than asserting a verdict.
+BLIND_SPOT_RATIO = 10
+
 
 def child_timeout_s(model_id: str, policy: str) -> int:
     """How long a draw may take before it is treated as hung.
@@ -463,7 +470,12 @@ def assign_variants(draws: list[dict]) -> None:
         for vi, cluster in enumerate(clusters):
             for i in cluster:
                 members[i]["variant"] = vi
-        vals = ", ".join(f"v{i}: {members[c[0]]['identity_distance']:.6f} x{len(c)}"
+        # Enough digits to SEE the split. Grouping is exact (rel_gap=0.0), so two
+        # groups always differ -- but at 6 dp two variants separated in their last
+        # bits print the same number, and the output then looks like a clustering
+        # bug rather than the benign split cluster_variants documents. Observed at
+        # 4B prompts 3 and 4, where it cost a real investigation to rule out.
+        vals = ", ".join(f"v{i}: {members[c[0]]['identity_distance']:.9g} x{len(c)}"
                          for i, c in enumerate(clusters))
         print(f"  {arm[0]}:{arm[1]}@p{arm[2]} -> {len(clusters)} variant(s)  [{vals}]")
 
@@ -556,6 +568,31 @@ def report(result: dict, layers_shown=None) -> None:
             cells.append(f"{offs[len(offs)//2]:>11.3e}" if offs else f"{'-':>11}")
         print(f"{kind:>15} {len(rows):>8} " + " ".join(cells))
     print("\n  (median over pairs; the full matrix is in the JSON)")
+
+    # A cross-group offset that dwarfs the within-group noise is not a variant
+    # offset. `f-2026-08-30-identity-distance-blind-spot` shows the gate is computed
+    # at the quietest layer and suppresses a wrong tensor by sqrt(d), so a
+    # miscompiled group can sit inside the 1% band and still be a different tensor.
+    # A uniformly-wrong group also passes the depth screen, which looks for
+    # CONTAMINATION within a group rather than a group that is consistently wrong --
+    # so this is the only place in the driver where such a group shows up at all.
+    noise = result["noise_rms"]
+    shallow = min(layers_shown)
+    null = noise.get(shallow)
+    worst = max((r["layers"].get(shallow, {}).get("offset") or 0
+                 for r in result["pairs"].values()), default=0)
+    if null and worst > BLIND_SPOT_RATIO * null:
+        print(f"\n  ** {worst / null:.0f}x the within-group noise at L{shallow} "
+              f"({worst:.3e} against {null:.3e}). **")
+        print("  A sound variant offset is the same order as the noise. This is not,")
+        print("  and identity_distance cannot rule out a miscompile that passed the")
+        print("  gate: it reads the quietest layer, where sqrt(d) suppresses exactly")
+        print("  this. The depth screen will not catch it either -- it looks for a")
+        print("  contaminated group, and a group that is uniformly wrong is clean by")
+        print("  that test. Draw this prompt uncompiled and compare; uncompiled")
+        print("  cannot miscompile, so whichever group sits far from it is the wrong")
+        print("  one:")
+        print(f"    --arms linear-attn:8:6:<prompt>,none:8:4:<prompt>")
 
     print("\n=== spread across ALL path pairs, per layer ===")
     hdr = f"{'layer':>6} {'min':>12} {'median':>12} {'max':>12} {'max/min':>9}"
