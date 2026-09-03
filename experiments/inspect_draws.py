@@ -119,6 +119,52 @@ def report(summary: dict, title: str) -> None:
               + " ".join(f"{r['norms'][l]:>13.4e}" for l in shown))
 
 
+def by_group(summary: dict) -> dict[str, dict[int, float]]:
+    """Mean ||J|| per layer, per group. Never pooled across groups -- see below."""
+    buckets: dict[str, list[dict]] = {}
+    for row in summary["rows"]:
+        buckets.setdefault(row["label"], []).append(row)
+    return {label: {layer: sum(r["norms"][layer] for r in rows) / len(rows)
+                    for layer in rows[0]["layers"]}
+            for label, rows in buckets.items()}
+
+
+def compare_norms(primary: dict, other: dict) -> None:
+    """Per-layer ||J||, per group, on both manifests.
+
+    **Per group, never pooled.** The first version of this averaged ||J|| across
+    every draw in a manifest and printed one ratio. On 4B prompt 4 that hid the
+    result: the three groups there sit at 337, 447 and 833 at L0, and their mean --
+    510 -- describes none of them and makes a 2.5x disagreement between execution
+    paths look like a 1.75x difference between prompts. A statistic pooled over
+    groups that disagree is a statistic about nothing.
+    """
+    groups = {"this": by_group(primary), "against": by_group(other)}
+    print("\n=== ||J|| per layer, per group ===")
+    print("A group whose norm collapses relative to the others has an inflated")
+    print("relative-Frobenius denominator, and every offset involving it is inflated")
+    print("with it. Groups that agree exclude that and point at the input instead.")
+    print("Watch the depth trend: a spread that closes toward the last source layer")
+    print("is a spread that identity_distance -- measured there -- cannot see.")
+
+    for which, table in groups.items():
+        if not table:
+            continue
+        layers = sorted(next(iter(table.values())))
+        shown = [layers[0], layers[len(layers) // 4], layers[len(layers) // 2],
+                 layers[-2], layers[-1]]
+        print(f"\n  [{which}]")
+        hdr = f"{'group':>28} " + " ".join(f"{'L' + str(l):>13}" for l in shown)
+        print("  " + hdr)
+        print("  " + "-" * len(hdr))
+        for label, norms in sorted(table.items()):
+            print(f"  {label:>28} " + " ".join(f"{norms[l]:>13.4e}" for l in shown))
+        if len(table) > 1:
+            print(f"  {'spread (max/min)':>28} " + " ".join(
+                f"{max(n[l] for n in table.values()) / min(n[l] for n in table.values()):>12.2f}x"
+                for l in shown))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -135,21 +181,7 @@ def main() -> None:
         other = summarise(args.against)
         report(other, args.against.stem)
 
-        pl, ol = primary["rows"], other["rows"]
-        if pl and ol:
-            layers = pl[0]["layers"]
-            print("\n=== ||J|| ratio, this manifest vs the comparison, per layer ===")
-            print("A ratio far below 1 means the relative-Frobenius denominator has")
-            print("collapsed here, which inflates every offset without any difference")
-            print("having grown. Near 1 excludes that, and points at the input instead.")
-            hdr = f"{'layer':>6} {'this':>13} {'against':>13} {'ratio':>8}"
-            print(hdr)
-            print("-" * len(hdr))
-            for layer in layers:
-                a = sum(r["norms"][layer] for r in pl) / len(pl)
-                b = sum(r["norms"].get(layer, 0) for r in ol) / len(ol)
-                if b:
-                    print(f"{layer:>6} {a:>13.4e} {b:>13.4e} {a / b:>8.3f}")
+        compare_norms(primary, other)
 
     out = cfg.artifact_root / "measurements" / "inspect-draws"
     out.mkdir(parents=True, exist_ok=True)
